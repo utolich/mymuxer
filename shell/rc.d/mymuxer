@@ -1,0 +1,24 @@
+#!/bin/sh
+
+# PROVIDE: mymuxer
+# REQUIRE: LOGIN NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="mymuxer"
+rcvar="mymuxer_enable"
+
+load_rc_config $name
+
+: ${mymuxer_enable:="NO"}
+: ${mymuxer_user:="root"}
+: ${mymuxer_dir:="/usr/local/mymuxer"}
+
+pidfile="/var/run/${name}.pid"
+mymuxer_pidfile="${mymuxer_dir}/pid/${name}.pid"
+
+command="/usr/sbin/daemon"
+command_args="-f -r -P ${pidfile} -p ${mymuxer_pidfile} -u ${mymuxer_user} -o /var/log/${name}.log ${mymuxer_dir}/${name}"
+
+run_rc_command "$1"

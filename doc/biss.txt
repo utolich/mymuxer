@@ -1,0 +1,25 @@
+Як підключити libdvbcsa на FreeBSD
+• Встановлення пакета:
+◦ pkg install libdvbcsa
+◦ або pkg install multimedia/libdvbcsa (freshports.org)
+• Бібліотека і заголовки ставляться у /usr/local/lib і /usr/local/include/dvbcsa/dvbcsa.h. (freshports.org)
+• Ліцензія libdvbcsa — GPLv2 (важливо для ліцензії проєкту). (freshports.org)
+
+Як збирати
+• cargo build --features dvbcsa
+
+Якщо pkg-config (pkgconf) не встановлений або не знаходить libdvbcsa, збірка все одно працює через fallback:
+• LIBDVBCSA_LIB_DIR + LIBDVBCSA_INCLUDE_DIR, або
+• LIBDVBCSA_DIR (автоматично додає lib/include), або
+• автопошук у /usr/local і /usr.
+Тобто pkg-config — це лише перший, зручний шлях.
+
+Якщо на FreeBSD нема pkg‑config
+• встанови pkgconf (зазвичай це pkg install pkgconf), і libdvbcsa вже буде знаходитися автоматично.
+
+
+
+Використання
+let biss = Biss1Descrambler::new_from_hex("123456789ABC")?;
+let mut pkt: [u8; 188] = /* TS packet */;
+biss.descramble_ts_packet(&mut pkt)?;
