@@ -31,8 +31,7 @@ pub async fn remote(
 
     'send: loop {
         let mut args = url.split_whitespace().collect::<Vec<&str>>();
-        args.append(&mut vec!["-f", "mpegts", "pipe:1"]);
-        println!("{:?}", args);
+        args.append(&mut vec!["pipe:1"]);
         let mut ffmpeg = Command::new("ffmpeg")
             .args(args)
             .stdout(Stdio::piped())

@@ -6,7 +6,7 @@ use http_body_util::StreamBody;
 use hyper::body::{Frame, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Request, Response};
+use hyper::{header, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -16,9 +16,9 @@ use tokio::sync::{RwLock, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::config;
+use crate::{config, misc};
 use crate::mux::PacketHandler;
-use crate::workers::{Helper, OutputStats, Worker};
+use crate::workers::{Helper, OutputStats};
 
 const BROADCAST_CAPACITY: usize = 256;
 
@@ -59,7 +59,6 @@ async fn server(
     let connections: Arc<RwLock<HashSet<SocketAddr>>> = Arc::new(RwLock::new(HashSet::new()));
 
     let (tx, _rx) = broadcast::channel::<Bytes>(BROADCAST_CAPACITY);
-    //drop(_rx);
 
     let mut rrx = rtx.subscribe();
 
@@ -109,6 +108,7 @@ async fn server(
                             if err_count == 0 {
                                 helper_accept.log_warn(&format!("Accept new connection error: {:?}", e));
                             } else {
+                                helper_accept.cmd_mark_dirty();
                                 break;
                             }
                             err_count += 1;
@@ -117,7 +117,6 @@ async fn server(
                 }
             }
         }
-        helper_accept.cmd_mark_dirty();
     });
 
 
@@ -168,7 +167,7 @@ async fn server(
         }
     }
 
-    if let Err(e) = Worker::wait_and_abort(accept_task).await {
+    if let Err(e) = misc::wait_and_abort(accept_task).await {
         packet_handler.helper.log(&format!("Force listening shutdown: {:?}", e));
     }
     
@@ -179,6 +178,7 @@ async fn handler(
     _req: Request<Incoming>,
     tx: broadcast::Sender<Bytes>,
 ) -> Result<Response<StreamBody<impl Stream<Item = Result<Frame<Bytes>>>>>> {
+
     let rx = tx.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(move |item| async move {
         match item {
@@ -188,7 +188,14 @@ async fn handler(
     });
 
     let body = StreamBody::new(stream);
-    let response = Response::new(body);
-
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "video/mp2t")
+        .header(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")
+        .header(header::PRAGMA, "no-cache")
+        .header(header::EXPIRES, "0")
+        .header(header::CONNECTION, "keep-alive")
+        .body(body)
+        .unwrap();
     Ok(response)
 }

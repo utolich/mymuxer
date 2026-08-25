@@ -29,6 +29,7 @@ mod status;
 mod supervisor;
 mod workers;
 mod epg;
+mod misc;
 
 #[tokio::main]
 async fn main() {
@@ -81,7 +82,7 @@ async fn main() {
         .with(error_layer)
         .init();
 
-    info!("myDemuxer started");
+    info!("MyMuxer started");
 
     let main_spawn = tokio::spawn(async move {
         let _ = run().await;

@@ -28,8 +28,6 @@ pub enum ApiActions {
     Log,
     #[strum(serialize = "cmd")]
     Cmd,
-    #[strum(serialize = "epg")]
-    Epg,
 }
 
 #[derive(Serialize)]
@@ -72,7 +70,8 @@ pub struct OutputStats {
     pub(crate) bitrate_psi: AtomicU64,
     pub(crate) bitrate_payload: AtomicU64,
     pub(crate) bitrate_null: AtomicU64,
-    pub(crate) bitrate_adjust: AtomicU64,
+    pub(crate) bitrate_adjust_payload: AtomicU64,
+    pub(crate) bitrate_adjust_null: AtomicU64,
     pub(crate) fps: AtomicU64,
 
     pub(crate) v_buffer_stats: BufferStats,
@@ -97,7 +96,8 @@ impl OutputStats {
             bitrate_psi: AtomicU64::new(0),
             bitrate_payload: AtomicU64::new(0),
             bitrate_null: AtomicU64::new(0),
-            bitrate_adjust: AtomicU64::new(0),
+            bitrate_adjust_payload: AtomicU64::new(0),
+            bitrate_adjust_null: AtomicU64::new(0),
             fps: AtomicU64::new(0),
 
             v_buffer_stats: BufferStats {
@@ -143,9 +143,15 @@ impl OutputStats {
         *count_packets = 0;
     }
 
-    pub fn update_bitrate_adjust(&self, count_packets: &mut usize) {
+    pub fn update_bitrate_adjust_null(&self, count_packets: &mut usize) {
         let bitrate = *count_packets * 8 * packet::TS_PACKET_SIZE;
-        self.bitrate_adjust.store(bitrate as u64, Ordering::Relaxed);
+        self.bitrate_adjust_null.store(bitrate as u64, Ordering::Relaxed);
+        *count_packets = 0;
+    }
+
+    pub fn update_bitrate_adjust_payload(&self, count_packets: &mut usize) {
+        let bitrate = *count_packets * 8 * packet::TS_PACKET_SIZE;
+        self.bitrate_adjust_payload.store(bitrate as u64, Ordering::Relaxed);
         *count_packets = 0;
     }
 
@@ -191,7 +197,7 @@ impl OutputStats {
             .store(buffer.size(), Ordering::Relaxed);
         self.v_buffer_stats
             .duration
-            .store(buffer.duration(), Ordering::Relaxed);
+            .store(buffer.duration_ms(), Ordering::Relaxed);
     }
 
     pub fn update_a_buffer(&self, buffer: &OutBuffer) {
@@ -200,7 +206,7 @@ impl OutputStats {
             .store(buffer.size(), Ordering::Relaxed);
         self.a_buffer_stats
             .duration
-            .store(buffer.duration(), Ordering::Relaxed);
+            .store(buffer.duration_ms(), Ordering::Relaxed);
     }
 }
 

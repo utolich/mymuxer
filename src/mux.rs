@@ -1,4 +1,3 @@
-use std::cmp::max;
 use crate::config::{Output, Program};
 use crate::status::OutputStats;
 use crate::workers::Helper;
@@ -30,9 +29,12 @@ const DEFAULT_SERVICE_TYPE: u8 = 0x01;
 const DISCONTINUITY_THRESHOLD_MS: u64 = 1_000;
 
 const DTS_PCR_DIFF_MS: u64 = 300;
-const MIN_JITTER_MS: u64 = 30;
-const MAX_JITTER_MS: u64 = 3_000;
 
+const MIN_DTS_PCR_DIFF_MS: i64 = 0;
+const MAX_DTS_PCR_DIFF_MS: i64 = 800;
+
+const MIN_JITTER_MS: u64 = 30;
+const MAX_JITTER_MS: u64 = 1_000;
 const DTS_MASK: u64 = (1u64 << 33) - 1;
 const DTS_HALF: u64 = 1u64 << 32;
 // PCR is a 33-bit base plus an extension in the range 0..300.
@@ -138,6 +140,9 @@ impl TsPacket {
         self.pcr = packet::pkt_extract_pcr(packet);
     }
 
+    fn set_discontinuity(&mut self, discontinuity: bool) {
+        self.discontinuity = discontinuity;
+    }
 }
 
 pub struct OutBuffer {
@@ -204,11 +209,15 @@ impl OutBuffer {
         self.inner.len() * packet::TS_PACKET_SIZE
     }
 
-    pub fn duration(&self) -> u64 {
+    pub fn duration_ms(&self) -> u64 {
         match (self.inner.front(), self.inner.back()) {
             (Some(first), Some(last)) => dts_forward_delta_ms(last.dts, first.dts).unwrap_or(0),
             _ => 0,
         }
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.duration_ms() == 0 && self.unique_frames_count > 1
     }
 }
 
@@ -256,7 +265,8 @@ pub struct PacketHandler {
     count_psi_packets: usize,
     count_null_packets: usize,
     count_payload_packets: usize,
-    count_adjust_packets: usize,
+    count_adjust_packets_null: usize,
+    count_adjust_packets_payload: usize,
     fps: f64,
 
     pcr_restamper: Option<PcrRestamper>,
@@ -345,7 +355,8 @@ impl PacketHandler {
             count_psi_packets: 0,
             count_null_packets: 0,
             count_payload_packets: 0,
-            count_adjust_packets: 0,
+            count_adjust_packets_null: 0,
+            count_adjust_packets_payload: 0,
             fps: 0.0,
 
             pcr_restamper,
@@ -450,11 +461,21 @@ impl PacketHandler {
         self.helper.cmd_unmark_dirty();
     }
 
-    pub fn write(&mut self, chunk: Bytes) {
-        if self.dirty {
-            return;
-        }
+    fn buffers_clear(&mut self) {
+        let msg = format!(
+            "Buffers clear: v:{},  a:{}",
+            self.out_buff_v.size(),
+            self.out_buff_a.size()
+        );
+        self.is_ready = false;
+        self.helper.log_warn(&msg);
+        self.out_buff_v.clear();
+        self.out_buff_a.clear();
+        self.min_buff_size = 0;
+        self.max_buff_size = 0;
+    }
 
+    pub fn write(&mut self, chunk: Bytes) {
         if self.in_buff.len() + chunk.len() < MAX_BUFFER_SIZE {
             self.in_buff.extend_from_slice(&chunk);
         } else {
@@ -581,7 +602,54 @@ impl PacketHandler {
                                     }
                                 }
                             }
-                        }
+                        },
+                        id if id == self.get_program().pmt_pid
+                            && (!self.pmt_ready || !self.is_ready) => {
+
+                            if let Some(mut section) = self.psi_reasm.push(&pkt_data) {
+                                let pmt_info = psi::pmt::analyze_pmt(&section);
+                                if !self.pmt_ready {
+                                    let mut es_mapping = Vec::new();
+                                    let video_pids = self.get_program().video_pids.clone();
+                                    for old_pid in video_pids {
+                                        es_mapping.push((old_pid, old_pid));
+                                    }
+                                    let audio_pids = self.get_program().audio_pids.clone();
+                                    for old_pid in audio_pids {
+                                        es_mapping.push((old_pid, old_pid));
+                                    }
+                                    let ca_flag = self.output.ca_flag == config::CA_FLAG_UNSCRAMBLED;
+
+                                    section = psi::pmt::patch_pmt_section(
+                                        &section,
+                                        pmt_info.pcr_pid,
+                                        &es_mapping,
+                                        ca_flag,
+                                    );
+
+                                    self.helper.log(&format!("PMT found: {:?}", pmt_info));
+                                    self.helper.log(&format!(
+                                        "Patched PMT: {:?}",
+                                        psi::pmt::analyze_pmt(&section)
+                                    ));
+
+                                    self.pmt_info = Some(pmt_info);
+
+                                    let cc = psi::cached_cc(&self.pmt);
+                                    self.pmt = psi::pack(&section, pid, cc);
+                                    self.pmt_ready = true;
+                                } else if let Some(cur_pmt_info) = &self.pmt_info {
+                                    if psi::pmt::is_pmt_changed(&cur_pmt_info, &pmt_info) {
+                                        self.helper.log_warn("PMT changed");
+                                        self.mark_dirty();
+                                    } else if self.dirty {
+                                        self.helper.log_warn("PMT restored");
+                                        self.unmark_dirty();
+                                    }
+                                }
+                            }
+                        },
+                        _ if self.dirty => continue,
                         0x0011 => {
                             if self.pat_ready && !self.sdt_ready {
                                 if let Some(section) = self.psi_reasm.push(&pkt_data) {
@@ -635,53 +703,7 @@ impl PacketHandler {
                                     }
                                 }
                             }
-                        }
-                        id if id == self.get_program().pmt_pid
-                            && (!self.pmt_ready || !self.is_ready) =>
-                        {
-                            if let Some(mut section) = self.psi_reasm.push(&pkt_data) {
-                                let pmt_info = psi::pmt::analyze_pmt(&section);
-                                if !self.pmt_ready {
-                                    let mut es_mapping = Vec::new();
-                                    let video_pids = self.get_program().video_pids.clone();
-                                    for old_pid in video_pids {
-                                        es_mapping.push((old_pid, old_pid));
-                                    }
-                                    let audio_pids = self.get_program().audio_pids.clone();
-                                    for old_pid in audio_pids {
-                                        es_mapping.push((old_pid, old_pid));
-                                    }
-                                    let ca_flag = self.output.ca_flag == config::CA_FLAG_UNSCRAMBLED;
-
-                                    section = psi::pmt::patch_pmt_section(
-                                        &section,
-                                        pmt_info.pcr_pid,
-                                        &es_mapping,
-                                        ca_flag,
-                                    );
-
-                                    self.helper.log(&format!("PMT found: {:?}", pmt_info));
-                                    self.helper.log(&format!(
-                                        "Patched PMT: {:?}",
-                                        psi::pmt::analyze_pmt(&section)
-                                    ));
-
-                                    self.pmt_info = Some(pmt_info);
-
-                                    let cc = psi::cached_cc(&self.pmt);
-                                    self.pmt = psi::pack(&section, pid, cc);
-                                    self.pmt_ready = true;
-                                } else if let Some(cur_pmt_info) = &self.pmt_info {
-                                    if psi::pmt::is_pmt_changed(&cur_pmt_info, &pmt_info) {
-                                        self.helper.log_warn("PMT changed");
-                                        self.mark_dirty();
-                                    } else if self.dirty {
-                                        self.helper.log_warn("PMT restored");
-                                        self.unmark_dirty();
-                                    }
-                                }
-                            }
-                        }
+                        },
                         id if self.is_audio_pid(&id) || self.is_video_pid(&id) => {
                             let mut discontinuity = packet::pkt_get_discontinuity(&pkt_data);
                             if !discontinuity {
@@ -699,41 +721,38 @@ impl PacketHandler {
                                                 "Discontinuity pid: {:#x}, dts jump: {} ms, v:{}, a:{}", pid, delta_ms, self.out_buff_v.size(), self.out_buff_a.size()
                                             ));
                                         }
+                                    } else {
+                                        discontinuity = true;
+                                        self.helper.log_warn(&format!(
+                                            "Discontinuity pid: {:#x}, invalid dts, v:{}, a:{}", pid, self.out_buff_v.size(), self.out_buff_a.size()
+                                        ));
                                     }
                                 }
                                 self.last_pts_dts.insert(pid, (pts, dts));
                             }
 
                             if let Some((pts, dts)) = self.last_pts_dts.get(&pid) {
-                                if self.is_video_pid(&pid) {
-                                    let data: [u8; packet::TS_PACKET_SIZE] =
-                                        pkt_data.try_into().unwrap();
-                                    let mut ts_packet =
-                                        TsPacket::new(data, pid, *pts, *dts, pusi, discontinuity);
+                                let data: [u8; packet::TS_PACKET_SIZE] = pkt_data.try_into().unwrap();
+                                let mut ts_packet = TsPacket::new(data, pid, *pts, *dts, pusi, discontinuity);
+
+                                if pid == self.get_program().pcr_pid {
                                     ts_packet.extract_pcr();
-                                    self.out_buff_v.push_back(ts_packet);
                                 }
-                                if self.is_audio_pid(&pid) {
-                                    let data: [u8; packet::TS_PACKET_SIZE] =
-                                        pkt_data.try_into().unwrap();
-                                    let ts_packet =
-                                        TsPacket::new(data, pid, *pts, *dts, pusi, false);
+
+                                if self.is_video_pid(&pid) {
+                                    self.out_buff_v.push_back(ts_packet);
+                                } else if self.is_audio_pid(&pid) {
                                     self.out_buff_a.push_back(ts_packet);
                                 }
                             }
 
                             if self.check_buffer_size {
-                                if self.is_ready && self.buffer_is_empty() {
-                                    self.buffers_clear();
-                                    self.last_pts_dts = HashMap::new();
-                                }
-
-                                if self.is_ready && self.buffer_is_full() {
+                                if self.is_ready && !self.is_buffer_valid() {
                                     self.buffers_clear();
                                     self.last_pts_dts = HashMap::new();
                                 }
                             }
-                        }
+                        },
                         _ => {}
                     }
                 } else {
@@ -745,69 +764,73 @@ impl PacketHandler {
             self.in_buff.advance(pointer);
         }
 
-        if !self.is_ready && self.pat_ready && self.pmt_ready {
-            if !self.sdt_ready {
-                let program = self.get_program();
-                let service_type = match program.service_type {
-                    0 => DEFAULT_SERVICE_TYPE,
-                    s => s as u8,
-                };
-                let provider_name = program.service_provider_name.trim();
-                let service_name = program.service_name.trim();
+        if self.dirty { return };
 
-                self.sdt = psi::sdt::prepare_sdt(
-                    self.pat_transport_stream_id(),
-                    program.program_id,
-                    service_type,
-                    provider_name,
-                    service_name,
-                );
-                self.sdt_ready = true;
+        if self.is_ready { return };
 
-                self.helper.log("Generated SDT from config");
-            }
+        if !self.pat_ready ||  !self.pmt_ready { return };
 
-            match (self.out_buff_v.front(), self.out_buff_v.back()) {
-                (Some(first), Some(last)) => {
-                    if dts_after(first.dts, last.dts) {
-                        self.helper.log(&format!(
-                            "Wrong DTS, flushing: {} - {}",
-                            first.dts, last.dts
-                        ));
-                        self.buffers_clear();
-                    } else {
-                        let buffer_duration = self.out_buff_v.duration();
+        if !self.sdt_ready {
+            let program = self.get_program();
+            let service_type = match program.service_type {
+                0 => DEFAULT_SERVICE_TYPE,
+                s => s as u8,
+            };
+            let provider_name = program.service_provider_name.trim();
+            let service_name = program.service_name.trim();
 
-                        if buffer_duration >= self.buffer_duration_ms {
-                            let buff_size = self.out_buff_v.size() + self.out_buff_a.size();
+            self.sdt = psi::sdt::prepare_sdt(
+                self.pat_transport_stream_id(),
+                program.program_id,
+                service_type,
+                provider_name,
+                service_name,
+            );
+            self.sdt_ready = true;
 
-                            self.min_buff_size = buff_size * 1_000 / buffer_duration as usize / 2;
-                            self.max_buff_size =
-                                buff_size * BUFFER_DURATION_MS * MAX_BUFFER_DURATION_COEF / buffer_duration as usize;
+            self.helper.log("Generated SDT from config");
+        }
 
-                            let bitrate = buff_size as u64 * 8 / buffer_duration;
-                            let msg = format!(
-                                "Buffer ready: duration {} ms, bitrate {} kbit/sec, size {} bytes, min {} bytes",
-                                buffer_duration, bitrate, buff_size, self.min_buff_size
-                            );
+        match (self.out_buff_v.front(), self.out_buff_v.back()) {
+            (Some(first), Some(last)) => {
+                if dts_after(first.dts, last.dts) {
+                    self.helper.log(&format!(
+                        "Wrong DTS, flushing: {} - {}",
+                        first.dts, last.dts
+                    ));
+                    self.buffers_clear();
+                } else {
+                    let buffer_duration = self.out_buff_v.duration_ms();
 
-                            if let Some(r) = self.pcr_restamper.as_mut() {
-                                if r.target_bitrate_bps == 0 {
-                                    r.target_bitrate_bps = (bitrate as f64 * 1.2 * 1024.00) as u64;
-                                }
+                    if buffer_duration >= self.buffer_duration_ms {
+                        let buff_size = self.out_buff_v.size() + self.out_buff_a.size();
+
+                        self.min_buff_size = buff_size * 1_000 / buffer_duration as usize / 2;
+                        self.max_buff_size =
+                            buff_size * BUFFER_DURATION_MS * MAX_BUFFER_DURATION_COEF / buffer_duration as usize;
+
+                        let bitrate = buff_size as u64 * 8 / buffer_duration;
+                        let msg = format!(
+                            "Buffer ready: duration {} ms, bitrate {} kbit/sec, size {} bytes, min {} bytess, max {} bytes",
+                            buffer_duration, bitrate, buff_size, self.min_buff_size, self.max_buff_size
+                        );
+
+                        if let Some(r) = self.pcr_restamper.as_mut() {
+                            if r.target_bitrate_bps == 0 {
+                                r.target_bitrate_bps = (bitrate as f64 * 1.2 * 1024.00) as u64;
                             }
+                        }
 
-                            self.helper.log_info(&msg);
-                            self.resync(first.dts);
-                            self.fps = self.calculate_fps().unwrap_or(0.0);
-                            self.is_ready = true;
-                            self.cc_errors = HashMap::new();
-                            self.stats.update_ready_time(Utc::now());
-                        };
-                    }
+                        self.helper.log_info(&msg);
+                        self.resync(first.dts);
+                        self.fps = self.calculate_fps().unwrap_or(0.0);
+                        self.is_ready = true;
+                        self.cc_errors = HashMap::new();
+                        self.stats.update_ready_time(Utc::now());
+                    };
                 }
-                _ => {}
             }
+            _ => {}
         };
     }
 
@@ -821,7 +844,9 @@ impl PacketHandler {
             .update_bitrate_payload(&mut self.count_payload_packets);
         self.stats.update_bitrate_null(&mut self.count_null_packets);
         self.stats
-            .update_bitrate_adjust(&mut self.count_adjust_packets);
+            .update_bitrate_adjust_payload(&mut self.count_adjust_packets_payload);
+        self.stats
+            .update_bitrate_adjust_null(&mut self.count_adjust_packets_null);
         let fps = self.calculate_fps().unwrap_or(self.fps);
         self.stats.update_fps(&fps);
         self.stats.update_jitter(self.jitter_ms);
@@ -835,7 +860,7 @@ impl PacketHandler {
             if let Some(last_cc) = self.last_cc.get(&pid) {
                 let expected_cc = (last_cc + 1) & 0x0F;
                 if current_cc != expected_cc {
-                    self.helper.log_warn(&format!(
+                    self.helper.log(&format!(
                         "Wrong cc: pid [{:#x}] received {} but expected {}",
                         pid, current_cc, expected_cc
                     ));
@@ -853,54 +878,42 @@ impl PacketHandler {
             .or_insert(1);
     }
 
-    fn buffers_clear(&mut self) {
-        let msg = format!(
-            "Buffers clear: v:{},  a:{}",
-            self.out_buff_v.size(),
-            self.out_buff_a.size()
-        );
-        self.is_ready = false;
-        self.helper.log_warn(&msg);
-        self.out_buff_v.clear();
-        self.out_buff_a.clear();
-        self.min_buff_size = 0;
-        self.max_buff_size = 0;
-    }
-
-    fn buffer_is_full(&mut self) -> bool {
-        let res = self.out_buff_v.size() + self.out_buff_a.size() > self.max_buff_size
-            || self.out_buff_v.duration() > 2 * BUFFER_DURATION_MS as u64;
-
-        if res {
+    fn is_buffer_valid(&mut self) -> bool {
+        if self.out_buff_v.size() + self.out_buff_a.size() < self.min_buff_size {
             self.helper.log(&format!(
-                "Buffer full: v:{}, a:{}, max:{}, duration:{}",
+                "Low buffer size: v:{}, a:{}, max:{}",
                 self.out_buff_v.size(),
                 self.out_buff_a.size(),
                 self.max_buff_size,
-                self.out_buff_v.duration()
             ));
+            return false;
         };
 
-        res
-    }
 
-    fn buffer_is_empty(&mut self) -> bool {
-        let res = self.out_buff_v.size() + self.out_buff_a.size() < self.min_buff_size;
-
-        if res {
+        if self.out_buff_v.size() + self.out_buff_a.size() > self.max_buff_size {
             self.helper.log(&format!(
-                "Buffer empty: v:{}, a:{}, min:{}",
+                "Buffer size exceeded: v:{}, a:{}, max:{}",
                 self.out_buff_v.size(),
                 self.out_buff_a.size(),
-                self.min_buff_size
+                self.max_buff_size,
             ));
+            return false;
         };
 
-        res
+        if self.out_buff_v.duration_ms() > 2 * BUFFER_DURATION_MS as u64 {
+            self.helper.log(&format!(
+                "Buffer duration exceeded: v:{}, duration:{}",
+                self.out_buff_v.size(),
+                self.out_buff_v.duration_ms()
+            ));
+            return false;
+        };
+
+        true
     }
 
     fn is_buffer_drain(&self) -> bool {
-        self.out_buff_v.duration() < BUFFER_DURATION_MS as u64
+        self.out_buff_v.duration_ms() < BUFFER_DURATION_MS as u64
     }
 
     fn is_video_pid(&self, pid: &u16) -> bool {
@@ -982,20 +995,6 @@ impl PacketHandler {
                     }
                     _ => {}
                 }
-            }
-        }
-
-        flush_count
-    }
-
-    pub fn flush_adjust_buf_packets(&self, out: &mut BytesMut) -> usize {
-        let mut flush_count: usize = 0;
-        if self.adjust_buf > 0 {
-            let d = self.out_buff_v.duration() as f64 / BUFFER_DURATION_MS as f64;
-            let adjust_buf = 1.0 - self.adjust_buf as f64 / 100.0;
-            if d < adjust_buf {
-                out.extend_from_slice(&packet::TS_NULL_PACKET);
-                flush_count = 1;
             }
         }
 
@@ -1134,72 +1133,68 @@ impl PacketHandler {
             pkt_count = pkt_count.saturating_sub(flush_count);
         }
 
+        for _ in 0..pkt_count {
 
-        let mut is_adjusted = false;
-        if pkt_count > 0 {
-            let flush_count = self.flush_adjust_buf_packets(&mut out);
-            if flush_count > 0 {
-                is_adjusted = true;
-                if let Some(r) = self.pcr_restamper.as_mut() {
-                    r.total_packets_sent += flush_count as u64;
-                }
-                self.count_adjust_packets += flush_count;
-                pkt_count = pkt_count.saturating_sub(flush_count);
+            if let Some(r) = self.pcr_restamper.as_mut() {
+                r.total_packets_sent += 1;
             }
-        }
 
-        if pkt_count > 0 {
-            for _ in 0..pkt_count {
-                if let Some(r) = self.pcr_restamper.as_mut() {
-                    r.total_packets_sent += 1;
+            let limit = BUFFER_DURATION_MS as f64 * (1.00 - self.adjust_buf as f64 / 100.00);
+
+            if !self.out_buff_v.is_dirty() && self.out_buff_v.duration_ms() < limit as u64 {
+                out.extend_from_slice(&packet::TS_NULL_PACKET);
+                self.count_adjust_packets_null += 1;
+                continue;
+            }
+
+            let packet = self.get_a_or_v_ready();
+
+            let data = match packet {
+                Some(pkt) => {
+                    self.count_payload_packets += 1;
+                    self.process_packet(pkt)
                 }
+                None => {
+                    let pkt =
+                        if self.out_buff_v.duration_ms() > BUFFER_DURATION_MS as u64 - 50 ||
+                            self.out_buff_v.is_dirty()
+                    {
+                        self.get_a_or_v()
+                        // self.get_v()
+                    } else {
+                        None
+                    };
 
-                let packet = self.get_a_or_v_ready();
-
-                let data = match packet {
-                    Some(pkt) => {
-                        self.count_payload_packets += 1;
+                    if let Some(pkt) = pkt {
+                        self.count_adjust_packets_payload += 1;
                         self.process_packet(pkt)
+                    } else {
+                        self.count_null_packets += 1;
+                        packet::TS_NULL_PACKET
                     }
-                    None => {
-                        let pkt = if !is_adjusted && self.adjust_buf > 0 &&
-                            self.in_buff.len() > (self.out_buff_v.size() as f64 * self.adjust_buf as f64 / 100.0) as usize
-                        {
-                            self.get_v()
-                        } else {
-                            None
-                        };
+                }
+            };
 
-                        if let Some(pkt) = pkt {
-                            self.count_payload_packets += 1;
-                            self.process_packet(pkt)
-                        } else {
-                            self.count_null_packets += 1;
-                            packet::TS_NULL_PACKET
-                        }
-                    }
-                };
-
-                out.extend_from_slice(&data);
-            }
+            out.extend_from_slice(&data);
         }
 
         Some(out.freeze())
     }
 
      fn process_packet(&mut self, pkt: TsPacket) -> [u8; packet::TS_PACKET_SIZE] {
-        let mut data = pkt.data.clone();
-
-        if pkt.discontinuity {
-            packet::pkt_set_discontinuity(&mut data);
-            self.resync(pkt.dts);
-        }
+        let mut data = pkt.data;
+        let mut discontinuity = pkt.discontinuity;
 
         if self.is_video_pid(&pkt.pid) {
             let dts_drift = self.dts_drift(pkt.dts);
-            if dts_drift < 0 {
-                self.resync(pkt.dts);
+            if !(MIN_DTS_PCR_DIFF_MS..=MAX_DTS_PCR_DIFF_MS).contains(&dts_drift) {
+                discontinuity = true;
             }
+        }
+
+        if discontinuity {
+            packet::pkt_set_discontinuity(&mut data);
+            self.resync(pkt.dts);
         }
 
         if pkt.pid == self.get_program().pcr_pid {
@@ -1268,18 +1263,18 @@ impl PacketHandler {
         packet
     }
 
-    fn get_v(&mut self) -> Option<TsPacket> {
-        let packet = match self.out_buff_v.front() {
-            Some(_) => self.out_buff_v.pop_front(),
-            None => None,
-        };
-        if self.is_buffer_process_async && packet.is_some() {
-            self.process_notify.notify_one();
-        };
-
-        packet
-    }
-
+    // fn get_v(&mut self) -> Option<TsPacket> {
+    //     let packet = match self.out_buff_v.front() {
+    //         Some(_) => self.out_buff_v.pop_front(),
+    //         None => None,
+    //     };
+    //     if self.is_buffer_process_async && packet.is_some() {
+    //         self.process_notify.notify_one();
+    //     };
+    //
+    //     packet
+    // }
+    //
     pub fn ready_send(&self, pts_or_dts: u64) -> bool {
         if let Some(current_pcr) = self.pcr_restamper.as_ref().and_then(|r| r.get_pcr()) {
             let ticks = pcr_normalize(pts_or_dts * 300);

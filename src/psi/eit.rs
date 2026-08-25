@@ -6,13 +6,7 @@ use chrono::{Duration, Utc};
 
 pub const PID: u16 = 0x0012;
 
-const MAX_DESCRIPTOR_PAYLOAD: usize = 255;
-const EXTENDED_HEADER_SIZE: usize = 6;
-const MAX_TEXT_BYTES_PER_DESC: usize = MAX_DESC_PAYLOAD - HEADER_SIZE - 1;
-const MAX_TEXT_PER_DESC: usize = MAX_DESC_PAYLOAD - HEADER_SIZE - 1;
-const MAX_DESC_PAYLOAD: usize = 255;
-const HEADER_SIZE: usize = 6;
-const MAX_TEXT_CHUNK: usize = 248;
+const MAX_TEXT_CHUNK: usize = 246;
 const DVB_UTF8_PREFIX: u8 = 0x15;
 
 pub fn build_extended_event_descriptors(
@@ -66,48 +60,6 @@ pub fn build_extended_event_descriptors(
     }
 
     descriptors
-}
-
-fn split_text_into_dvb_chunks(mut text: &str, max_bytes: usize) -> Vec<&str> {
-    let mut chunks = Vec::new();
-
-    while !text.is_empty() {
-        if text.len() <= max_bytes {
-            chunks.push(text);
-            break;
-        }
-
-        let safe_len = text.floor_char_boundary(max_bytes);
-        if safe_len == 0 {
-            break;
-        }
-
-        chunks.push(&text[..safe_len]);
-        text = &text[safe_len..];
-    }
-
-    chunks
-}
-
-fn split_text_to_chunks(mut text: &str, max_bytes: usize) -> Vec<&str> {
-    let mut chunks = Vec::new();
-
-    while !text.is_empty() {
-        if text.len() <= max_bytes {
-            chunks.push(text);
-            break;
-        }
-        let safe_len = text.floor_char_boundary(max_bytes);
-
-        if safe_len == 0 {
-            break;
-        }
-
-        chunks.push(&text[..safe_len]);
-        text = &text[safe_len..];
-    }
-
-    chunks
 }
 
 fn parse_iso_639_2(lang: &str) -> [u8; 3] {
@@ -166,7 +118,9 @@ pub fn present_following_section(
     }
 
     let desc_loop_len = descriptors_loop.len() as u16;
-    assert!(desc_loop_len <= 0x0FFF, "Descriptors loop length overflow!");
+    if desc_loop_len > 0x0FFF {
+        descriptors_loop.truncate(0x0FFF);
+    }
 
     let mut section = vec![
         0x4E,

@@ -1,6 +1,6 @@
-use crate::config;
+use crate::{config, misc};
 use crate::hls_client::HlsClient;
-use crate::workers::{InputStats, Helper, Worker, send_broadcast_chunks};
+use crate::workers::{InputStats, Helper, send_broadcast_chunks};
 use anyhow::Result;
 use bytes::Bytes;
 use std::sync::Arc;
@@ -43,18 +43,15 @@ pub async fn remote(
 
         match response {
             Ok((mut receiver, client_handle)) => {
-                let mut client_handle = Some(client_handle);
                 loop {
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => {
                             helper.log_pause("Input hls stopped");
-                            if let Some(handle) = client_handle.take() {
-                                match Worker::wait_and_abort(handle).await {
-                                    Ok(true) => helper.log("Input HLS stopped"),
-                                    Ok(false) => helper.log("Input HLS did not stop within timeout, aborting"),
-                                    Err(e) => helper.log(&format!("Input HLS error: {}", e)),
-                                }
+                            match misc::wait_and_abort(client_handle).await {
+                                Ok(true) => helper.log("Input HLS stopped"),
+                                Ok(false) => helper.log("Input HLS did not stop within timeout, aborting"),
+                                Err(e) => helper.log(&format!("Input HLS error: {}", e)),
                             }
                             break 'send;
                         },
@@ -67,12 +64,10 @@ pub async fn remote(
                                 None => {
                                     let msg = "Hls client stopped";
                                     helper.log_warn(msg);
-                                    if let Some(handle) = client_handle.take() {
-                                        match Worker::wait_and_abort(handle).await {
-                                            Ok(true) => helper.log("Input HLS stopped"),
-                                            Ok(false) => helper.log("Input HLS did not stop within timeout, aborting"),
-                                            Err(e) => helper.log(&format!("Input HLS error: {}", e)),
-                                        }
+                                    match misc::wait_and_abort(client_handle).await {
+                                        Ok(true) => helper.log("Input HLS stopped"),
+                                        Ok(false) => helper.log("Input HLS did not stop within timeout, aborting"),
+                                        Err(e) => helper.log(&format!("Input HLS error: {}", e)),
                                     }
                                     break;
                                 }

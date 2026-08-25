@@ -1,7 +1,6 @@
 use crate::psi;
 use serde::Serialize;
 use std::collections::HashMap;
-use crate::psi::pat::PatInfo;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StreamInfo {

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json;
@@ -14,8 +13,6 @@ const CONFIG_FILE: &str = "config/config.json";
 pub(crate) const LOG_DIR: &str = "logs";
 pub(crate) const STREAMS_LOG_DIR: &str = "logs/streams";
 pub(crate) const ALLOWED_TASK_TYPES: [&str; 5] = ["udp", "rtp", "http", "ffmpeg", "hls"];
-
-pub(crate) const CA_FLAG_OFF: usize = 0;
 pub(crate) const CA_FLAG_UNSCRAMBLED: usize = 1;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -81,19 +78,6 @@ pub struct Program {
 }
 
 impl Config {
-    pub fn new() -> Self {
-        Self {
-            mgnt: Mgnt {
-                hash: String::new(),
-                last_update: 0.0,
-                admin_url: String::new(),
-                allow: Vec::new(),
-            },
-            epg_configs: Vec::new(),
-            streams: Vec::new(),
-        }
-    }
-
     pub fn get_stream(&self, id: u32) -> Option<&Stream> {
         self.streams.iter().find(|s| s.id == id)
     }

@@ -1,16 +1,14 @@
 use crate::config::Stream;
 use crate::status::{ApiConfig, InputStats, OutputStats};
 use crate::supervisor::Supervisor;
-use crate::{config, status};
+use crate::{config, misc, status};
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
-use chrono::Utc;
 use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
-use std::time::Duration;
 use strum::Display;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
@@ -30,7 +28,6 @@ mod output_udp;
 
 const BROADCAST_CAPACITY: usize = 256;
 const BROADCAST_CHUNK_SIZE: usize = 64 * crate::packet::TS_PACKET_SIZE;
-const STOP_GRACE_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub fn send_broadcast_chunks(tx: &broadcast::Sender<Bytes>, chunk: Bytes) -> usize {
     let len = chunk.len();
@@ -220,7 +217,7 @@ impl Worker {
 
         let outputs = std::mem::take(&mut self.outputs);
         for (id, task) in outputs {
-            match Self::wait_and_abort(task.handle).await {
+            match misc::wait_and_abort(task.handle).await {
                 Ok(true) => self.helper.log(&format!("Output {} stopped", id)),
                 Ok(false) => self.helper.log(&format!(
                     "Output {} did not stop within timeout, aborting",
@@ -231,7 +228,7 @@ impl Worker {
         }
 
         let remote_handle = self.remote.handle;
-        match Self::wait_and_abort(remote_handle).await {
+        match misc::wait_and_abort(remote_handle).await {
             Ok(true) => self.helper.log("Remote stopped"),
             Ok(false) => self
                 .helper
@@ -240,27 +237,6 @@ impl Worker {
         }
 
         Ok(())
-    }
-
-    pub(crate) async fn wait_and_abort(handle: JoinHandle<()>) -> Result<bool> {
-        if handle.is_finished() {
-            return Ok(false);
-        }
-
-        let mut handle = handle;
-        match tokio::time::timeout(STOP_GRACE_TIMEOUT, &mut handle).await {
-            Ok(res) => {
-                match res {
-                    Ok(_) => Ok(false),
-                    Err(e) => Err(anyhow!(e)),
-                }
-            }
-            Err(_) => {
-                handle.abort();
-                let _ = handle.await;
-                Ok(true)
-            }
-        }
     }
 
     // pub async fn start_output(&mut self, output_id: &u32) -> Result<()> {
@@ -282,7 +258,7 @@ impl Worker {
     pub async fn stop_output(&mut self, output_id: &u32) -> Result<()> {
         if let Some(task) = self.outputs.remove(output_id) {
             task.cancel.cancel();
-            match Self::wait_and_abort(task.handle).await {
+            match misc::wait_and_abort(task.handle).await {
                 Ok(true) => self.helper.log(&format!("Output {} stopped", output_id)),
                 Ok(false) => self.helper.log(&format!(
                     "Output {} did not stop within timeout, aborting",
@@ -461,12 +437,8 @@ impl Helper {
 }
 
 pub struct Dump {
-    id: u32,
     handle: JoinHandle<()>,
     cancel: CancellationToken,
-    tx: broadcast::Sender<Bytes>,
-    helper: Helper,
-    start_time: i64,
 }
 
 pub async fn start(supervisor: &Supervisor, id: &u32) -> Result<Worker> {
@@ -501,16 +473,12 @@ pub fn start_dump(config: Stream, tx: broadcast::Sender<Bytes>, helper: Helper) 
     let task = Worker::spawn_remote(config.clone(), tx.clone(), helper.clone());
 
     Dump {
-        id: config.id,
         handle: task.handle,
         cancel: task.cancel,
-        tx,
-        helper,
-        start_time: Utc::now().timestamp(),
     }
 }
 
 pub async fn stop_dump(dump: Dump) -> Result<bool> {
     dump.cancel.cancel();
-    Worker::wait_and_abort(dump.handle).await
+    misc::wait_and_abort(dump.handle).await
 }

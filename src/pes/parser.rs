@@ -100,12 +100,12 @@ impl PesReassemblerMap {
 pub struct Parser;
 
 impl Parser {
-    pub fn parse(data: &[u8], pid: u16, stream_type: Option<u8>) -> Option<Pes> {
+    pub fn parse(data: &[u8], _pid: u16, stream_type: Option<u8>) -> Option<Pes> {
         if data.len() < 4 {
             return None;
         }
 
-        let mut pes = Pes::new(pid);
+        let mut pes = Pes::new();
         let mut pointer = 0usize;
         if data.len() < pointer + 4 {
             return None;
@@ -131,7 +131,6 @@ impl Parser {
             return None;
         }
 
-        // Matches the PHP behavior: uses the marker byte as stream_id.
         pes.stream_id = tmp_marker & 0xFF;
 
         if data.len() < pointer + 2 {

@@ -5,12 +5,14 @@ use reqwest::Client;
 use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use crate::misc;
 
 const MAX_SEGMENTS_COUNT: usize = 50;
 const CONNECTIONS_TIMEOUT_SEC: u64 = 3;
@@ -65,7 +67,7 @@ impl HlsClient {
         let http_client = Client::builder()
             .redirect(reqwest::redirect::Policy::limited(5))
             .connect_timeout(Duration::from_secs(CONNECTIONS_TIMEOUT_SEC))
-            .user_agent("mydemuxer")
+            .user_agent("mymuxer")
             .build()?;
         Ok(Self {
             http_client,
@@ -82,15 +84,59 @@ impl HlsClient {
         cancel: CancellationToken,
     ) -> Result<(mpsc::Receiver<Bytes>, JoinHandle<()>)> {
         let master_url = Url::parse(url).map_err(|e| anyhow!(e.to_string()))?;
-        let (tx, rx) = mpsc::channel(1);
+        let (tx, rx) = mpsc::channel(32);
         let mut downloaded_chunks = ChunkQueue::new(MAX_SEGMENTS_COUNT);
         let http_client = self.http_client.clone();
+        let chunks: Arc<RwLock<VecDeque<(f32, BytesMut)>>> = Arc::new(RwLock::new(VecDeque::new()));
+        let chunk_notify: Arc<Notify> = Arc::new(Notify::new());
+
+        let chunks_out = Arc::clone(&chunks);
+        let chunk_notify_out = Arc::clone(&chunk_notify);
+        let cancel_out = cancel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel_out.cancelled() => return,
+                    _ = tx.closed() => return,
+                    _ = chunk_notify_out.notified() => {}
+                }
+
+                let chunks = {
+                    let mut guard = chunks_out.write().await;
+                    guard.pop_front()
+                };
+
+
+                if let Some((duration, mut chunk)) = chunks {
+                    let time_ns: u64 = (1_000_000_000.00 * duration as f64 * 1316.00 as f64 / chunk.len() as f64) as u64; // nanoseconds
+                    let mut timer = tokio::time::interval(Duration::from_nanos(time_ns));
+                    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = cancel_out.cancelled() => break,
+                            _ = tx.closed() => break,
+                            _ = timer.tick() => {
+                                if chunk.is_empty() {
+                                    break;
+                                }
+                                let data_len = chunk.len().min(1316);
+                                let data = chunk.split_to(data_len).freeze();
+                                if let Err(_) = tx.send(data).await {
+                                    break;
+                                };
+                            }
+                        }
+                    }
+                };
+            };
+        });
 
         let handle = tokio::spawn(async move {
             let body = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return,
-                _ = tx.closed() => return,
                 r = fetch_url(&http_client, &master_url) => match r {
                     Ok(text) => text,
                     _ => return
@@ -119,10 +165,9 @@ impl HlsClient {
                 let playlist_text = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return,
-                    _ = tx.closed() => return,
                     r = fetch_url(&http_client, &media_playlist_url) => match r {
                         Ok(text) if !text.is_empty() => text,
-                        _ if wait_interval(&cancel, &tx, 2.0).await.is_err() && error_count > MAX_ERROR_COUNT => {
+                        _ if misc::wait_interval(&cancel, 2.0).await.is_err() && error_count > MAX_ERROR_COUNT => {
                             return;
                         },
                         _ => {
@@ -142,7 +187,7 @@ impl HlsClient {
                                 .collect();
                             (uris, media.target_duration as f32)
                         }
-                        _ if wait_interval(&cancel, &tx, 2.0).await.is_err()
+                        _ if misc::wait_interval(&cancel, 2.0).await.is_err()
                             && error_count > MAX_ERROR_COUNT =>
                         {
                             return;
@@ -179,10 +224,9 @@ impl HlsClient {
                     let response = tokio::select! {
                         biased;
                         _ = cancel.cancelled() => return,
-                        _ = tx.closed() => return,
                         r = timeout(Duration::from_secs(FETCH_SEGMENT_TIMEOUT_SEC), http_client.get(absolute_chunk_url).send()) => match r {
                             Ok(Ok(response)) if response.status().is_success() => response,
-                            _ if wait_interval(&cancel, &tx, 2.0).await.is_err() && error_count > MAX_ERROR_COUNT => {
+                            _ if misc::wait_interval(&cancel, 2.0).await.is_err() && error_count > MAX_ERROR_COUNT => {
                                 return;
                             },
                             _ => {
@@ -201,7 +245,7 @@ impl HlsClient {
                     match timeout(Duration::from_secs(FETCH_SEGMENT_TIME_SEC), async {
                         let mut stream = response.bytes_stream();
                         while let Some(Ok(bytes)) = stream.next().await {
-                            if cancel.is_cancelled() || tx.is_closed() {
+                            if cancel.is_cancelled() {
                                 return Err(());
                             }
                             chunk_data.extend_from_slice(&bytes);
@@ -214,15 +258,19 @@ impl HlsClient {
                     .await
                     {
                         Ok(Ok(_)) => {
-                            let send_data = chunk_data.freeze();
-                            if let Err(_) = tx.send(send_data).await {
-                                return;
-                            }
-                            downloaded_chunks.push(chunk_uri);
-                            error_segment_count = 0;
-                            let sleep_secs = chunk_duration / 2.0;
-                            if wait_interval(&cancel, &tx, sleep_secs).await.is_err() {
-                                return;
+                            if !chunk_data.is_empty() {
+                                {
+                                    let mut guard = chunks.write().await;
+                                    guard.push_back((chunk_duration, chunk_data));
+                                };
+
+                                chunk_notify.notify_one();
+                                downloaded_chunks.push(chunk_uri);
+                                error_segment_count = 0;
+                                let sleep_secs = chunk_duration / 2.0;
+                                if misc::wait_interval(&cancel, sleep_secs).await.is_err() {
+                                    return;
+                                }
                             }
                         }
                         _ => {
@@ -241,7 +289,7 @@ impl HlsClient {
                     2.0
                 };
 
-                if wait_interval(&cancel, &tx, refresh_interval).await.is_err() {
+                if misc::wait_interval(&cancel, refresh_interval).await.is_err() {
                     return;
                 }
             }
@@ -260,16 +308,4 @@ async fn fetch_url(http_client: &Client, url: &Url) -> Result<String> {
     let text = response.text().await?;
 
     Ok(text)
-}
-
-async fn wait_interval(
-    cancel: &CancellationToken,
-    tx: &mpsc::Sender<Bytes>,
-    interval: f32,
-) -> Result<(), ()> {
-    tokio::select! {
-        _ = cancel.cancelled() => Err(()),
-        _ = tx.closed() => Err(()),
-        _ = tokio::time::sleep(Duration::from_secs_f32(interval)) => Ok(())
-    }
 }

@@ -1,7 +1,7 @@
 use crate::packet;
 use crate::packet::MPEG2_CRC;
 use crate::packet::{TS_PACKET_SIZE, TS_SYNC_BYTE, pkt_pid};
-use chrono::{DateTime, Datelike, Local, Offset, Timelike, Utc};
+use chrono::{Datelike, Offset, Timelike, Utc};
 use chrono_tz::Tz;
 use std::collections::HashMap;
 
@@ -266,7 +266,7 @@ fn mjd(mut year: i32, mut month: i32, day: i32) -> u16 {
 }
 
 fn get_local_offset_bcd(timezone: &str) -> [u8; 2] {
-    let tz: Tz = timezone.parse().unwrap();
+    let tz: Tz = timezone.parse().unwrap_or(chrono_tz::UCT);
 
     let now = Utc::now();
     let local = now.with_timezone(&tz);
@@ -296,77 +296,4 @@ pub(crate) fn cached_cc(cached_pkt: &[u8; packet::TS_PACKET_SIZE]) -> u8 {
     } else {
         0
     }
-}
-
-fn psi_header(section: &[u8]) -> Option<(u8, u16, u8, bool)> {
-    if section.len() < 8 {
-        return None;
-    }
-
-    let table_id = section[0];
-    let table_id_extension = u16::from_be_bytes([section[3], section[4]]);
-    let version_number = (section[5] >> 1) & 0x1F;
-    let current_next = (section[5] & 0x01) != 0;
-
-    Some((table_id, table_id_extension, version_number, current_next))
-}
-
-fn cached_psi_header(cached_pkt: &[u8; packet::TS_PACKET_SIZE]) -> Option<(u8, u16, u8, bool)> {
-    if cached_pkt[0] != packet::TS_SYNC_BYTE || cached_pkt[1] & 0x40 == 0 {
-        return None;
-    }
-
-    let af_control = (cached_pkt[3] >> 4) & 0x03;
-    let mut offset = 4;
-
-    match af_control {
-        0 | 2 => return None,
-        1 => {}
-        3 => {
-            let af_len = cached_pkt[offset] as usize;
-            offset = offset.checked_add(1)?.checked_add(af_len)?;
-            if offset >= cached_pkt.len() {
-                return None;
-            }
-        }
-        _ => unreachable!(),
-    }
-
-    let pointer = cached_pkt[offset] as usize;
-    offset = offset.checked_add(1)?.checked_add(pointer)?;
-    let header_end = offset.checked_add(8)?;
-    if header_end > packet::TS_PACKET_SIZE {
-        return None;
-    }
-
-    psi_header(&cached_pkt[offset..header_end])
-}
-
-pub(crate) fn psi_section_changed(
-    cached_pkt: &[u8; packet::TS_PACKET_SIZE],
-    section: &[u8],
-) -> bool {
-    let Some((table_id, table_id_extension, version_number, current_next)) = psi_header(section)
-    else {
-        return false;
-    };
-
-    if !current_next {
-        return false;
-    }
-
-    let Some((
-        cached_table_id,
-        cached_table_id_extension,
-        cached_version_number,
-        cached_current_next,
-    )) = cached_psi_header(cached_pkt)
-    else {
-        return false;
-    };
-
-    table_id != cached_table_id
-        || table_id_extension != cached_table_id_extension
-        || version_number != cached_version_number
-        || !cached_current_next
 }

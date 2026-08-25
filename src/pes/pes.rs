@@ -1,5 +1,4 @@
 pub struct Pes {
-    pub pid: u16,
     pub stream_id: u8,
     pub scrabling: u8,
     pub priority: u8,
@@ -13,15 +12,12 @@ pub struct Pes {
     pub flag_additional_copy_info: u8,
     pub flag_crc: u8,
     pub flag_extension: u8,
-    pub pts: Option<u64>,
-    pub dts: Option<u64>,
     pub es: Option<super::es::Es>,
 }
 
 impl Pes {
-    pub(crate) fn new(pid: u16) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            pid,
             stream_id: 0,
             scrabling: 0,
             priority: 0,
@@ -35,8 +31,6 @@ impl Pes {
             flag_additional_copy_info: 0,
             flag_crc: 0,
             flag_extension: 0,
-            pts: None,
-            dts: None,
             es: None,
         }
     }

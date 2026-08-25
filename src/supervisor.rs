@@ -3,7 +3,7 @@ use crate::config::{Config, Stream};
 use crate::probe::{ProbeResult, probe};
 use crate::status::{ApiConfig, OutputStats};
 use crate::workers::{Dump, Worker};
-use crate::{config, epg, status, workers};
+use crate::{config, epg, misc, status, workers};
 use anyhow::{Result, anyhow};
 use axum::body::Body;
 use axum::extract::Path;
@@ -421,6 +421,29 @@ impl Supervisor {
                     }
                 });
             }
+
+            // EPG
+            let mut epg_tasks_ids = Vec::new();
+            {
+                let mut epg_tasks = self.epg.write().await;
+                epg_tasks.retain(|id, task| {
+                    let is_finished = task.handle.is_finished();
+                    if is_finished {
+                        error!("EPG {} is finished", id);
+                        epg_tasks_ids.push(*id);
+                    };
+                    !is_finished
+                });
+            }
+            for id in epg_tasks_ids {
+                let supervisor = Arc::clone(&self);
+                tokio::spawn(async move {
+                    if let Err(e) = supervisor.start_epg(&id).await {
+                        error!("Error restart epg {}: {:?}", id, e);
+                    }
+                });
+            }
+
             sleep(Duration::from_secs(1)).await;
         }
     }
@@ -668,8 +691,12 @@ impl Supervisor {
         }
     }
 
-    async fn epg_start(&self, id: &u32) -> Result<()>{
+    async fn start_epg(&self, id: &u32) -> Result<()>{
         let mut epg_task = self.epg.write().await;
+
+        if epg_task.contains_key(id) {
+            return Err(anyhow!("EPG already running for stream with id {}", id));
+        }
 
         let (start_config, api_config) = {
             let guard = self.config.read().await;
@@ -707,7 +734,7 @@ impl Supervisor {
         Ok(())
     }
 
-    async fn epg_stop(&self, id: &u32) -> Result<()>{
+    async fn stop_epg(&self, id: &u32) -> Result<()>{
         let epg_task = {
             self.epg.write().await.remove(&id)
         };
@@ -715,7 +742,7 @@ impl Supervisor {
         match epg_task {
             Some(epg_task) => {
                 epg_task.cancel.cancel();
-                Worker::wait_and_abort(epg_task.handle).await?;
+                misc::wait_and_abort(epg_task.handle).await?;
             },
             None => return Err(anyhow!("EPG not running"))
         }
@@ -793,7 +820,7 @@ async fn server(supervisor: Arc<Supervisor>) -> Result<()> {
                 let supervisor = Arc::clone(&supervisor);
                 move |Path(id): Path<u32>| async move {
                     tokio::spawn(async move {
-                        match supervisor.epg_start(&id).await {
+                        match supervisor.start_epg(&id).await {
                             Ok(_) => {},
                             Err(e) => error!("{:?}", e)
                         }
@@ -810,7 +837,7 @@ async fn server(supervisor: Arc<Supervisor>) -> Result<()> {
                 let supervisor = Arc::clone(&supervisor);
                 move |Path(id): Path<u32>| async move {
                     tokio::spawn(async move {
-                        match supervisor.epg_stop(&id).await {
+                        match supervisor.stop_epg(&id).await {
                             Ok(_) => {},
                             Err(e) => error!("{:?}", e)
                         }

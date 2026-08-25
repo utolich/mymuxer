@@ -10,11 +10,11 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::error;
+use tracing::{error, info};
 use url::Url;
 use crate::config::EpgConfig;
 use crate::packet::TS_PACKET_SIZE;
-use crate::{packet, psi};
+use crate::{misc, packet, psi};
 use crate::status::ApiConfig;
 
 const EIT_PERIOD_MS: u64 = 1_000;
@@ -83,7 +83,67 @@ pub(crate) async fn run(cancel: CancellationToken, start_config: EpgConfig, api_
     let url = start_config.url.as_str();
     let dest =  parse_udp_url(url)?;
     let id = start_config.id;
-    let (epg_state, epg_network, epg_events) = load_epg_events(&api_config, &id).await?;
+
+    info!("EPG #{} started", id);
+
+    let now = Instant::now();
+    let last_download = Arc::new(RwLock::new(now));
+    let last_process = Arc::new(RwLock::new(now));
+    let last_send = Arc::new(RwLock::new(now));
+
+    let last_download_clone = Arc::clone(&last_download);
+    let last_process_clone = Arc::clone(&last_process);
+    let last_send_clone = Arc::clone(&last_send);
+    let monitor_cancel = cancel.clone();
+    tokio::spawn(async move {
+        loop {
+            if {
+                let guard = last_download_clone.read().await;
+                guard.elapsed()
+            } > tokio::time::Duration::from_secs(20) {
+                error!("EPG download is too rarely");
+                break;
+            }
+            if {
+                let guard = last_send_clone.read().await;
+                guard.elapsed()
+            } > tokio::time::Duration::from_secs(20) {
+                if {
+                    let guard = last_process_clone.read().await;
+                    guard.elapsed()
+                } < tokio::time::Duration::from_secs(20) {
+                    error!("EPG sent is too rarely");
+                    break;
+                }
+            }
+
+            if {
+                let guard = last_process_clone.read().await;
+                guard.elapsed()
+            } > tokio::time::Duration::from_mins(60) {
+                error!("EPG processed is too rarely");
+                break;
+            }
+
+            if misc::wait_interval(&monitor_cancel, 5f32).await.is_err() {
+                break;
+            };
+        }
+
+        monitor_cancel.cancel();
+    });
+
+    let (epg_state, epg_network, epg_events) = loop {
+        if let Ok((epg_state, epg_network, epg_events)) = load_epg_events(&api_config, &id).await {
+            if !epg_events.is_empty() {
+                break (epg_state, epg_network, epg_events);
+            }
+        }
+
+        if misc::wait_interval(&cancel, 10f32).await.is_err() {
+            return Ok(());
+        };
+    };
 
     let mut current_epg_state = EpgState::new(
         epg_state.current_version,
@@ -91,11 +151,7 @@ pub(crate) async fn run(cancel: CancellationToken, start_config: EpgConfig, api_
         epg_state.last_hash,
     );
 
-    if epg_events.is_empty() {
-        return Err(anyhow!("no EPG events found"));
-    }
-
-    let epg_services = Arc::new(RwLock::new((epg_state, epg_network, group_events_by_service(epg_events))));
+    let epg_services = Arc::new(RwLock::new(Arc::new((epg_state, epg_network, group_events_by_service(epg_events)))));
     let bind_addr = if dest.is_ipv4() {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
     } else {
@@ -105,8 +161,12 @@ pub(crate) async fn run(cancel: CancellationToken, start_config: EpgConfig, api_
 
     let load_cancel = cancel.clone();
     let load_epg_services = Arc::clone(&epg_services);
-    let load_handle = tokio::spawn(async move {
+
+    let last_download_clone = Arc::clone(&last_download);
+
+    let _load_handle = tokio::spawn(async move {
         let mut timer_load_events = tokio::time::interval(std::time::Duration::from_secs(5));
+        let last_download_clone = Arc::clone(&last_download_clone);
         loop {
             tokio::select! {
                 _ = load_cancel.cancelled() => {
@@ -115,8 +175,13 @@ pub(crate) async fn run(cancel: CancellationToken, start_config: EpgConfig, api_
                 _ = timer_load_events.tick() => {
                     match load_epg_events(&api_config, &id).await {
                         Ok((new_epg_state, new_epg_network, new_epg_events)) => {
+                            {
+                                let mut guard = last_download_clone.write().await;
+                                *guard = Instant::now();
+                            }
+                            let group_epg_events = group_events_by_service(new_epg_events);
                             let mut guard = load_epg_services.write().await;
-                            *guard = (new_epg_state, new_epg_network, group_events_by_service(new_epg_events));
+                            *guard = Arc::new((new_epg_state, new_epg_network, group_epg_events));
                         },
                         Err(e) => {
                             error!("EPG load failed: {:?}", e);
@@ -126,6 +191,7 @@ pub(crate) async fn run(cancel: CancellationToken, start_config: EpgConfig, api_
                 }
             }
         }
+        error!("EPG load task exited");
     });
 
     let mut last_tdt = Instant::now();
@@ -135,13 +201,16 @@ pub(crate) async fn run(cancel: CancellationToken, start_config: EpgConfig, api_
 
     let mut packets = VecDeque::new();
 
-    'cycle: loop {
+    let last_process_clone = Arc::clone(&last_process);
+    loop {
         let now = Utc::now();
         let mut sections = Vec::new();
-        let (new_epg_state, new_epg_network, new_epg_events) = {
+        let epg_services_clone = {
             let guard = epg_services.read().await;
-            guard.clone()
+            Arc::clone(&guard)
         };
+
+        let (new_epg_state, new_epg_network, new_epg_events) = epg_services_clone.as_ref();
 
         if new_epg_state.last_hash != current_epg_state.last_hash {
             current_epg_state.current_version = (current_epg_state.current_version + 1) & 0x1F;
@@ -162,10 +231,15 @@ pub(crate) async fn run(cancel: CancellationToken, start_config: EpgConfig, api_
             last_tdt = instant_now;
         }
 
-        for ((original_network_id, transport_stream_id, service_id), events) in &new_epg_events {
+        for ((original_network_id, transport_stream_id, service_id), events) in new_epg_events {
             let Some((present, following)) = present_following_events(events, now) else {
                 continue;
             };
+
+            {
+                let mut guard = last_process_clone.write().await;
+                *guard = Instant::now();
+            }
 
             sections.push(psi::eit::present_following_section(
                 *service_id,
@@ -220,10 +294,11 @@ pub(crate) async fn run(cancel: CancellationToken, start_config: EpgConfig, api_
         let mut timer = tokio::time::interval(tokio::time::Duration::from_nanos(time_ns));
 
         let mut sent_bytes = 0;
+        let last_send_clone = Arc::clone(&last_send);
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
-                    break 'cycle;
+                    return Ok(());
                 },
                 _ = timer.tick() => {
                     if packets.len() < EIT_TS_PACKET_COUNT {
@@ -234,10 +309,23 @@ pub(crate) async fn run(cancel: CancellationToken, start_config: EpgConfig, api_
                         let pkt = packets.pop_front().unwrap_or_else(|| packet::TS_NULL_PACKET);
                         out.extend_from_slice(&pkt);
                     };
-                    match socket.send_to(&out, dest).await {
-                        Ok(bytes) => sent_bytes += bytes,
-                        Err(e) => {
+                    match tokio::time::timeout(tokio::time::Duration::from_secs(3), socket.send_to(&out, dest)).await {
+                        Ok(Ok(bytes)) => {
+                            {
+                                let mut guard = last_send_clone.write().await;
+                                *guard = Instant::now();
+                            }
+                            sent_bytes += bytes;
+                        },
+                        Ok(Err(e)) => {
                             error!("EPG send failed: {:?}", e);
+                            if misc::wait_interval(&cancel, 5f32).await.is_err() {
+                                return Ok(());
+                            };
+                            break;
+                        },
+                        Err(_) => {
+                            error!("EPG send timeout");
                             break;
                         }
                     };
@@ -245,8 +333,6 @@ pub(crate) async fn run(cancel: CancellationToken, start_config: EpgConfig, api_
             }
         }
     }
-
-    Ok(())
 }
 
 fn parse_udp_url(value: &str) -> Result<SocketAddr> {

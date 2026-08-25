@@ -33,7 +33,7 @@ pub async fn remote(
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::limited(5))
         .connect_timeout(Duration::from_secs(3))
-        .user_agent("mydemuxer")
+        .user_agent("mymuxer")
         .build()?;
 
     'send: loop {
