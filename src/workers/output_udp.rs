@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+use tracing::error;
 
 const CONNECTIONS_REPEAT: usize = 3;
 
@@ -46,7 +47,7 @@ pub async fn output(
             }
         }
     } else {
-        println!("No program found");
+        error!("No program found");
     }
 
     Ok(())
@@ -70,6 +71,11 @@ async fn proxy(
 
     loop {
         tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                packet_handler.helper.log_pause("Output udp (proxy): stopping");
+                break;
+            },
             res = rx.recv() => {
                 match res {
                     Ok(chunk) => {
@@ -100,10 +106,6 @@ async fn proxy(
                 packet_handler.update_stats();
                 packet_handler.stats.update_bitrate(sent_bytes as u64 * 8);
                 sent_bytes = 0;
-            },
-            _ = cancel.cancelled() => {
-                packet_handler.helper.log_pause("Output udp (proxy): stopping");
-                break;
             }
         }
     }
@@ -166,7 +168,6 @@ async fn cbr(
     let mut _ticks: usize = 0;
 
     packet_handler.set_check_buffer_size();
-    packet_handler.set_buffer_process_async();
     loop {
         tokio::select! {
             biased;
@@ -194,7 +195,6 @@ async fn cbr(
                 sent_bytes = 0;
                 _ticks = 0;
             },
-            _ = packet_handler.buffer_process() => {},
             res = rx.recv() => {
                 match res {
                     Ok(chunk) => {

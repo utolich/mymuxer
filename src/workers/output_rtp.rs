@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+use tracing::error;
 
 const CONNECTIONS_REPEAT: usize = 3;
 
@@ -47,7 +48,7 @@ pub async fn output(
             }
         }
     } else {
-        println!("No program found");
+        error!("No program found");
     }
 
     Ok(())
@@ -171,7 +172,6 @@ async fn cbr(
     let mut _ticks: usize = 0;
 
     packet_handler.set_check_buffer_size();
-    packet_handler.set_buffer_process_async();
 
     let rtp_state = RtpState::new();
 
@@ -203,7 +203,6 @@ async fn cbr(
                 sent_bytes = 0;
                 _ticks = 0;
             },
-            _ = packet_handler.buffer_process() => {},
             res = rx.recv() => {
                 match res {
                     Ok(chunk) => {

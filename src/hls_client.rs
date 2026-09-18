@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Notify, RwLock};
+use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 use tokio_stream::StreamExt;
@@ -88,20 +88,11 @@ impl HlsClient {
         let mut downloaded_chunks = ChunkQueue::new(MAX_SEGMENTS_COUNT);
         let http_client = self.http_client.clone();
         let chunks: Arc<RwLock<VecDeque<(f32, BytesMut)>>> = Arc::new(RwLock::new(VecDeque::new()));
-        let chunk_notify: Arc<Notify> = Arc::new(Notify::new());
 
         let chunks_out = Arc::clone(&chunks);
-        let chunk_notify_out = Arc::clone(&chunk_notify);
         let cancel_out = cancel.clone();
         tokio::spawn(async move {
             loop {
-                tokio::select! {
-                    biased;
-                    _ = cancel_out.cancelled() => return,
-                    _ = tx.closed() => return,
-                    _ = chunk_notify_out.notified() => {}
-                }
-
                 let chunks = {
                     let mut guard = chunks_out.write().await;
                     guard.pop_front()
@@ -128,6 +119,10 @@ impl HlsClient {
                                 };
                             }
                         }
+                    }
+                } else {
+                    if misc::wait_interval(&cancel_out, 0.1).await.is_err() {
+                        break;
                     }
                 };
             };
@@ -211,6 +206,8 @@ impl HlsClient {
                     is_first_fetch = false;
                 }
 
+                let mut is_timeout_next_segment = true;
+
                 for (chunk_uri, chunk_duration) in segments_uris {
                     if downloaded_chunks.contains(&chunk_uri) {
                         continue;
@@ -218,8 +215,13 @@ impl HlsClient {
 
                     let absolute_chunk_url = match media_playlist_url.join(&chunk_uri) {
                         Ok(u) => u,
-                        Err(_) => continue,
+                        Err(_) => {
+                            downloaded_chunks.push(chunk_uri);
+                            continue
+                        },
                     };
+
+                    downloaded_chunks.push(chunk_uri);
 
                     let response = tokio::select! {
                         biased;
@@ -264,33 +266,36 @@ impl HlsClient {
                                     guard.push_back((chunk_duration, chunk_data));
                                 };
 
-                                chunk_notify.notify_one();
-                                downloaded_chunks.push(chunk_uri);
                                 error_segment_count = 0;
-                                let sleep_secs = chunk_duration / 2.0;
+
+                                let sleep_secs = if chunks.read().await.len() > 1 {
+                                    chunk_duration
+                                } else {
+                                    chunk_duration / 2.0
+                                };
+
                                 if misc::wait_interval(&cancel, sleep_secs).await.is_err() {
                                     return;
                                 }
+                                is_timeout_next_segment = false;
                             }
                         }
                         _ => {
                             error_segment_count += 1;
-                            if error_segment_count > MAX_ERROR_COUNT {
-                                downloaded_chunks.push(chunk_uri);
-                            }
                             continue 'segments;
                         }
                     };
                 }
 
-                let refresh_interval = if target_duration > 0.0 {
-                    target_duration / 2.0
-                } else {
-                    2.0
-                };
-
-                if misc::wait_interval(&cancel, refresh_interval).await.is_err() {
-                    return;
+                if is_timeout_next_segment {
+                    let refresh_interval = if target_duration > 0.0 {
+                        target_duration / 2.0
+                    } else {
+                        2.0
+                    };
+                    if misc::wait_interval(&cancel, refresh_interval).await.is_err() {
+                        return;
+                    }
                 }
             }
         });

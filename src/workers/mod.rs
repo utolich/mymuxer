@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 use strum::Display;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
@@ -25,6 +25,10 @@ mod input_udp;
 mod output_http;
 mod output_rtp;
 mod output_udp;
+#[cfg(unix)]
+mod output_unix;
+#[cfg(unix)]
+mod input_unix;
 
 const BROADCAST_CAPACITY: usize = 256;
 const BROADCAST_CHUNK_SIZE: usize = 64 * crate::packet::TS_PACKET_SIZE;
@@ -169,11 +173,13 @@ impl Worker {
                 "hls" => input_hls::remote(rtx, remote, cancel_child, helper_clone, stats_clone)
                     .await
                     .unwrap(),
-                "ffmpeg" => {
-                    input_ffmpeg::remote(rtx, remote, cancel_child, helper_clone, stats_clone)
+                "ffmpeg" => input_ffmpeg::remote(rtx, remote, cancel_child, helper_clone, stats_clone)
                         .await
-                        .unwrap()
-                }
+                        .unwrap(),
+                #[cfg(unix)]
+                "unix" => input_unix::remote(rtx, remote, cancel_child, helper_clone, stats_clone)
+                    .await
+                    .unwrap(),
                 _ => {}
             }
         });
@@ -200,6 +206,10 @@ impl Worker {
                     .await
                     .unwrap(),
                 "rtp" => output_rtp::output(rtx, output, cancel_child, helper_clone, stats_clone)
+                    .await
+                    .unwrap(),
+                #[cfg(unix)]
+                "unix" => output_unix::output(rtx, output, cancel_child, helper_clone, stats_clone)
                     .await
                     .unwrap(),
                 _ => {}
@@ -293,12 +303,26 @@ pub enum Cmd {
     UnMarkDirty,
 }
 
+enum ApiMessage {
+    Log {
+        worker_id: u32,
+        output_id: u32,
+        message: String,
+        level: LogLevels,
+    },
+    Cmd {
+        worker_id: u32,
+        output_id: u32,
+        cmd: Cmd,
+    },
+}
+
 #[derive(Clone)]
 pub struct Helper {
     worker_id: u32,
     output_id: u32,
     namespace: String,
-    api_config: Option<Arc<ApiConfig>>,
+    api_tx: Option<mpsc::UnboundedSender<ApiMessage>>,
     log_writer: NonBlocking,
     _log_guard: Arc<WorkerGuard>,
 }
@@ -318,7 +342,7 @@ impl Helper {
             worker_id,
             output_id: 0,
             namespace: "main".to_string(),
-            api_config: None,
+            api_tx: None,
             log_writer,
             _log_guard: Arc::from(log_guard),
         }
@@ -333,7 +357,18 @@ impl Helper {
     }
 
     pub fn set_api_config(&mut self, api_config: ApiConfig) {
-        self.api_config = Some(Arc::from(api_config));
+        let api_config = Arc::new(api_config);
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel();
+
+        tokio::spawn(async move {
+            while let Some(message) = api_rx.recv().await {
+                if let Err(e) = send_api_message(&api_config, message).await {
+                    error!("Failed to send worker API message: {:?}", e);
+                }
+            }
+        });
+
+        self.api_tx = Some(api_tx);
     }
 
     pub fn log(&mut self, message: &str) {
@@ -360,37 +395,11 @@ impl Helper {
     fn send_log(&mut self, message: &str, level: LogLevels) {
         self.log(message);
 
-        let api_config = match &self.api_config {
-            Some(config) => config.clone(),
-            None => return,
-        };
-
-        let msg = message.to_string();
-        let level = level.to_string();
-        let worker_id = self.worker_id;
-        let output_id = self.output_id;
-
-        tokio::spawn(async move {
-            let mut admin_url = Url::parse(&api_config.admin_url)?;
-            admin_url.set_path("/api/client");
-
-            let api_client = api_config
-                .api_client
-                .as_ref()
-                .ok_or_else(|| anyhow!("Api client not set"))?;
-
-            let data = json!({
-                "worker_id": worker_id,
-                "output_id": output_id,
-                "message": msg,
-                "level": level,
-            });
-            let payload = status::api_data_log(&api_config, data)?;
-            if let Err(e) = api_client.send(admin_url, payload).await {
-                error!("{:?}", e);
-            };
-
-            Ok::<(), anyhow::Error>(())
+        self.send_api_message(ApiMessage::Log {
+            worker_id: self.worker_id,
+            output_id: self.output_id,
+            message: message.to_string(),
+            level,
         });
     }
 
@@ -402,38 +411,63 @@ impl Helper {
     }
 
     fn send_cmd(&self, cmd: Cmd) {
-        let api_config = match &self.api_config {
-            Some(config) => config.clone(),
-            None => return,
-        };
-
-        let cmd = cmd.to_string();
-        let worker_id = self.worker_id;
-        let output_id = self.output_id;
-
-        tokio::spawn(async move {
-            let mut admin_url = Url::parse(&api_config.admin_url)?;
-            admin_url.set_path("/api/client");
-
-            let api_client = api_config
-                .api_client
-                .as_ref()
-                .ok_or_else(|| anyhow!("Api client not set"))?;
-
-            let data = json!({
-                "cmd": cmd,
-                "worker_id": worker_id,
-                "output_id": output_id,
-            });
-            let payload = status::api_data_cmd(&api_config, data)?;
-            if let Err(e) = api_client.send(admin_url, payload).await {
-                error!("{:?}", e);
-            };
-
-            Ok::<(), anyhow::Error>(())
+        self.send_api_message(ApiMessage::Cmd {
+            worker_id: self.worker_id,
+            output_id: self.output_id,
+            cmd,
         });
     }
 
+    fn send_api_message(&self, message: ApiMessage) {
+        if let Some(api_tx) = &self.api_tx {
+            if api_tx.send(message).is_err() {
+                error!("Worker API message sender stopped");
+            }
+        }
+    }
+
+}
+
+async fn send_api_message(api_config: &ApiConfig, message: ApiMessage) -> Result<()> {
+    let mut admin_url = Url::parse(&api_config.admin_url)?;
+    admin_url.set_path("/api/client");
+
+    let api_client = api_config
+        .api_client
+        .as_ref()
+        .ok_or_else(|| anyhow!("Api client not set"))?;
+
+    let payload = match message {
+        ApiMessage::Log {
+            worker_id,
+            output_id,
+            message,
+            level,
+        } => status::api_data_log(
+            api_config,
+            json!({
+                "worker_id": worker_id,
+                "output_id": output_id,
+                "message": message,
+                "level": level.to_string(),
+            }),
+        )?,
+        ApiMessage::Cmd {
+            worker_id,
+            output_id,
+            cmd,
+        } => status::api_data_cmd(
+            api_config,
+            json!({
+                "cmd": cmd.to_string(),
+                "worker_id": worker_id,
+                "output_id": output_id,
+            }),
+        )?,
+    };
+    api_client.send(admin_url, payload).await?;
+
+    Ok(())
 }
 
 pub struct Dump {

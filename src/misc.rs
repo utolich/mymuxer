@@ -1,4 +1,6 @@
+use std::net::Ipv4Addr;
 use anyhow::anyhow;
+use ipnet::Ipv4Net;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio::time::Duration;
@@ -34,4 +36,22 @@ pub(crate) async fn wait_and_abort(handle: JoinHandle<()>) -> anyhow::Result<boo
             Ok(true)
         }
     }
+}
+
+pub(crate) fn is_forbidden(ip: &str, ip_nets: &Vec<String>) -> bool {
+    let mut deny = true;
+    if ip_nets.len() == 0 {
+        deny = false;
+    } else {
+        let ip: Ipv4Addr = ip.parse().unwrap();
+        for net in ip_nets {
+            let ipnet: Ipv4Net = net.parse().unwrap();
+            if ipnet.contains(&ip) {
+                deny = false;
+                break;
+            }
+        }
+    }
+
+    deny
 }

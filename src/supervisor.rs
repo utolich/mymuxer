@@ -1,9 +1,3 @@
-use crate::api_client::ApiClient;
-use crate::config::{Config, Stream};
-use crate::probe::{ProbeResult, probe};
-use crate::status::{ApiConfig, OutputStats};
-use crate::workers::{Dump, Worker};
-use crate::{config, epg, misc, status, workers};
 use anyhow::{Result, anyhow};
 use axum::body::Body;
 use axum::extract::Path;
@@ -18,25 +12,36 @@ use axum::{
 use bytes::Bytes;
 use chrono::Utc;
 use hyper::StatusCode;
-use ipnet::Ipv4Net;
 use scopeguard::guard;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::string::String;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use strum::Display;
 use tokio::net::TcpListener;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{broadcast, RwLock};
+#[cfg(unix)]
+use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use url::Url;
+
+use crate::api_client::ApiClient;
+use crate::config::{Config, Stream};
+use crate::database::Storage;
+use crate::probe::{ProbeResult, probe};
+use crate::status::{ApiConfig, OutputStats};
+use crate::workers::{Dump, Worker};
+use crate::{config, epg, misc, status, workers};
+#[cfg(unix)]
+use crate::http_router::{HttpRouter, HttpRouterTask, HttpRouterCmd};
 use crate::epg::epg::EpgTask;
 
 const URL_LISTENER: &str = "0.0.0.0:8787";
@@ -110,16 +115,19 @@ pub struct Supervisor {
     pub(crate) config: RwLock<Option<Config>>,
     dirty: AtomicBool,
     last_update: AtomicI64,
-    workers: RwLock<HashMap<u32, Worker>>,
+    pub(crate) workers: RwLock<HashMap<u32, Worker>>,
     workers_lock: Mutex<HashSet<u32>>,
     probe_lock: Mutex<HashSet<u32>>,
     dumps: RwLock<HashMap<u32, Dump>>,
     pub(crate) api_client: Option<ApiClient>,
-    epg: RwLock<HashMap<u32, EpgTask>>
+    database: Arc<Storage>,
+    epg: RwLock<HashMap<u32, EpgTask>>,
+    #[cfg(unix)]
+    http_router: RwLock<HashMap<u32, HttpRouterTask>>
 }
 
 impl Supervisor {
-    fn new() -> Self {
+    fn new(database: Arc<Storage>) -> Self {
         Self {
             src_config: RwLock::new(None),
             config: RwLock::new(None),
@@ -130,7 +138,10 @@ impl Supervisor {
             probe_lock: Mutex::new(HashSet::new()),
             dumps: RwLock::new(HashMap::new()),
             api_client: ApiClient::new(Duration::from_secs(3)).ok(),
-            epg: RwLock::new(HashMap::new())
+            database,
+            epg: RwLock::new(HashMap::new()),
+            #[cfg(unix)]
+            http_router: RwLock::new(HashMap::new())
         }
     }
 
@@ -195,7 +206,6 @@ impl Supervisor {
                 return Err(anyhow!(msg));
             }
         };
-
         let update_result = timeout(Duration::from_millis(50), async {
             let mut src_lock = self.src_config.write().await;
             let mut cfg_lock = self.config.write().await;
@@ -438,7 +448,7 @@ impl Supervisor {
             for id in epg_tasks_ids {
                 let supervisor = Arc::clone(&self);
                 tokio::spawn(async move {
-                    if let Err(e) = supervisor.start_epg(&id).await {
+                    if let Err(e) = supervisor.epg_start(&id).await {
                         error!("Error restart epg {}: {:?}", id, e);
                     }
                 });
@@ -667,31 +677,18 @@ impl Supervisor {
         }
     }
 
-    async fn forbidden(&self, ip: String) -> bool {
+    async fn is_forbidden(&self, ip: String) -> bool {
         let config = self.config.read().await;
         match config.as_ref() {
             Some(config) => {
-                let mgnt = &config.mgnt;
-                let mut deny = true;
-                if mgnt.allow.len() == 0 {
-                    deny = false;
-                } else {
-                    let ip: Ipv4Addr = ip.parse().unwrap();
-                    for net in mgnt.allow.clone() {
-                        let ipnet: Ipv4Net = net.parse().unwrap();
-                        if ipnet.contains(&ip) {
-                            deny = false;
-                            break;
-                        }
-                    }
-                }
-                deny
+                let ip_nets = config.mgnt.allow.clone();
+                misc::is_forbidden(&ip, &ip_nets)
             }
             None => false,
         }
     }
 
-    async fn start_epg(&self, id: &u32) -> Result<()>{
+    async fn epg_start(&self, id: &u32) -> Result<()>{
         let mut epg_task = self.epg.write().await;
 
         if epg_task.contains_key(id) {
@@ -734,7 +731,7 @@ impl Supervisor {
         Ok(())
     }
 
-    async fn stop_epg(&self, id: &u32) -> Result<()>{
+    async fn epg_stop(&self, id: &u32) -> Result<()>{
         let epg_task = {
             self.epg.write().await.remove(&id)
         };
@@ -749,10 +746,119 @@ impl Supervisor {
 
         Ok(())
     }
+
+    #[cfg(unix)]
+    async fn http_router_start(&self) -> Result<()> {
+        let config = {
+            let guard = self.config.read().await;
+            guard
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| anyhow!("Config not loaded"))?
+        };
+
+        let http_routers = config.http_routers;
+
+        for config_router in http_routers {
+            let mut http_router = self.http_router.write().await;
+
+            let id = config_router.id;
+
+            if http_router.contains_key(&id) {
+                error!("Http router already running id {}", &id);
+                continue;
+            }
+
+            let cancel = CancellationToken::new();
+            let cancel_child = cancel.child_token();
+            let database = Arc::clone(&self.database);
+            let (tx, rx) = mpsc::channel(1);
+            let handle = tokio::spawn(async move {
+                let mut http_router = HttpRouter::new(config_router, cancel_child, database, rx);
+                let _ = http_router.run().await;
+            });
+
+            http_router.insert(id, HttpRouterTask{
+                handle,
+                cancel,
+                tx
+            });
+        }
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn http_router_stop(&self) -> Result<()>{
+        let http_router_ids = {
+            let http_router = self.http_router.read().await;
+            http_router.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+        };
+
+        for id in http_router_ids {
+            let http_router_task = self.http_router.write().await.remove(&id);
+            match http_router_task {
+                Some(http_router_task) => {
+                    http_router_task.cancel.cancel();
+                    misc::wait_and_abort(http_router_task.handle).await?;
+                },
+                None => return Err(anyhow!("Http router {} not running", id))
+            }
+        };
+
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn http_router_add_alias(&self, id: u32, alias: String, socket: String) -> Result<()> {
+
+        let http_router = self.http_router.read().await;
+        if !http_router.contains_key(&id) {
+            return Err(anyhow!("Http router with id {} not found", id));
+        }
+
+        if let Ok(Some(exists)) = self.database.get_alias(&id, &alias) && exists == socket {
+            return Ok(());
+        }
+
+        self.database.set_alias(&id, &alias, &socket)?;
+        if let Some(tx) = self.http_router.read().await.get(&id).map(|r| r.tx.clone()) {
+            tx.send(HttpRouterCmd::AddAlias(alias, socket)).await?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn http_router_rm_alias(&self, id: u32, alias: String) -> Result<()> {
+        self.database.remove_alias(&id, &alias)?;
+        if let Some(tx) = self.http_router.read().await.get(&id).map(|r| r.tx.clone()) {
+            tx.send(HttpRouterCmd::RemoveAlias(alias)).await?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn http_router_add_key(&self, key: String) -> Result<()> {
+        self.database.add_key(&key)?;
+
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn http_router_rm_key(&self, key: String) -> Result<()> {
+        self.database.remove_key(&key)?;
+
+        Ok(())
+    }
+
 }
 
 pub async fn run() -> Result<()> {
-    let supervisor = Arc::new(Supervisor::new());
+    let database = Arc::new(Storage::open_default()?);
+    let supervisor = Arc::new(Supervisor::new(database));
     let _ = config::pid_filename().await;
     match config::read_config().await {
         Ok(cfg_json) => {
@@ -813,14 +919,121 @@ async fn server(supervisor: Arc<Supervisor>) -> Result<()> {
                     })
                 }
             }),
+        );
+
+    #[cfg(unix)]
+    let app = app
+        .route(
+            "/httprouter/addkey/{key}",
+            get({
+                let supervisor = Arc::clone(&supervisor);
+                move |Path(key): Path<String>| async move {
+                    tokio::spawn(async move {
+                        match supervisor.http_router_add_key(key).await {
+                            Ok(_) => {},
+                            Err(e) => error!("{:?}", e)
+                        }
+                    });
+                    Json(json!({
+                        "success": true
+                    }))
+                }
+            }),
         )
+        .route(
+            "/httprouter/rmkey/{key}",
+            get({
+                let supervisor = Arc::clone(&supervisor);
+                move |Path(key): Path<String>| async move {
+                    tokio::spawn(async move {
+                        match supervisor.http_router_rm_key(key).await {
+                            Ok(_) => {},
+                            Err(e) => error!("{:?}", e)
+                        }
+                    });
+                    Json(json!({
+                        "success": true
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/httprouter/addalias/{id}/{alias}/{socket}",
+            get({
+                let supervisor = Arc::clone(&supervisor);
+                move |Path((id, alias, socket)): Path<(u32, String, String)>| async move {
+                    tokio::spawn(async move {
+                        match supervisor.http_router_add_alias(id, alias, socket).await {
+                            Ok(_) => {},
+                            Err(e) => error!("{:?}", e)
+                        }
+                    });
+                    Json(json!({
+                        "success": true
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/httprouter/rmalias/{id}/{alias}",
+            get({
+                let supervisor = Arc::clone(&supervisor);
+                move |Path((id, alias)): Path<(u32, String)>| async move {
+                    tokio::spawn(async move {
+                        match supervisor.http_router_rm_alias(id, alias).await {
+                            Ok(_) => {},
+                            Err(e) => error!("{:?}", e)
+                        }
+                    });
+                    Json(json!({
+                        "success": true
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/httprouter/start",
+            get({
+                let supervisor = Arc::clone(&supervisor);
+                move || async move {
+                    tokio::spawn(async move {
+                        match supervisor.http_router_start().await {
+                            Ok(_) => {},
+                            Err(e) => error!("{:?}", e)
+                        }
+                    });
+                    Json(json!({
+                        "success": true
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/httprouter/stop",
+            get({
+                let supervisor = Arc::clone(&supervisor);
+                move || async move {
+                    tokio::spawn(async move {
+                        match supervisor.http_router_stop().await {
+                            Ok(_) => {},
+                            Err(e) => error!("{:?}", e)
+                        }
+                    });
+                    Json(json!({
+                        "success": true
+                    }))
+                }
+            }),
+        );
+
+    let app = app
         .route(
             "/epg/start/{id}",
             get({
                 let supervisor = Arc::clone(&supervisor);
                 move |Path(id): Path<u32>| async move {
                     tokio::spawn(async move {
-                        match supervisor.start_epg(&id).await {
+                        match supervisor.epg_start(&id).await {
                             Ok(_) => {},
                             Err(e) => error!("{:?}", e)
                         }
@@ -837,7 +1050,7 @@ async fn server(supervisor: Arc<Supervisor>) -> Result<()> {
                 let supervisor = Arc::clone(&supervisor);
                 move |Path(id): Path<u32>| async move {
                     tokio::spawn(async move {
-                        match supervisor.stop_epg(&id).await {
+                        match supervisor.epg_stop(&id).await {
                             Ok(_) => {},
                             Err(e) => error!("{:?}", e)
                         }
@@ -1249,7 +1462,7 @@ async fn server(supervisor: Arc<Supervisor>) -> Result<()> {
                 let supervisor = Arc::clone(&supervisor);
                 async move {
                     if addr.is_ipv4() {
-                        match supervisor.forbidden(addr.ip().to_string()).await {
+                        match supervisor.is_forbidden(addr.ip().to_string()).await {
                             true => (StatusCode::FORBIDDEN, format!("Access denied {}", addr))
                                 .into_response(),
                             false => next.run(req).await,

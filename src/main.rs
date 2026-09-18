@@ -18,18 +18,21 @@ use tracing_subscriber::{Layer, Registry, fmt};
 mod api_client;
 mod biss;
 mod config;
+mod database;
 mod hls_client;
 mod mux;
 mod packet;
 mod pes;
 mod probe;
-pub mod proto;
+mod proto;
 mod psi;
 mod status;
 mod supervisor;
 mod workers;
 mod epg;
 mod misc;
+#[cfg(unix)]
+mod http_router;
 
 #[tokio::main]
 async fn main() {
@@ -92,7 +95,9 @@ async fn main() {
 }
 
 async fn run() {
-    let _ = supervisor::run().await;
+    if let Err(e) = supervisor::run().await {
+        error!("Supervisor failed: {:?}", e);
+    }
 }
 
 async fn start_cleanup_task(log_dir: PathBuf, days: u64) {

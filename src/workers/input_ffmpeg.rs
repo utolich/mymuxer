@@ -29,6 +29,8 @@ pub async fn remote(
     timer_stats.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
     let mut sent_bytes: usize = 0;
 
+    let mut dirty = false;
+    
     'send: loop {
         let mut args = url.split_whitespace().collect::<Vec<&str>>();
         args.append(&mut vec!["pipe:1"]);
@@ -58,21 +60,41 @@ pub async fn remote(
                     match res {
                         Ok(Ok(0)) => {
                             helper.log_warn("Input ffmpeg stdout closed");
+                            
+                            if !dirty {
+                                dirty = true;
+                                helper.cmd_mark_dirty();
+                            }
                             break;
                         },
                         Ok(Ok(n)) => {
                             sent_bytes += n;
                             let _ = tx.send(Bytes::copy_from_slice(&buffer[..n]));
                             last_chunk_at = Instant::now();
+                            
+                            if dirty {
+                                dirty = false;
+                                helper.cmd_unmark_dirty();
+                            }
                         },
                         Ok(Err(e)) => {
                             let msg = format!("Failed to fetch remote data {:?}", e);
                             helper.log_warn(&msg);
+                            
+                            if !dirty {
+                                dirty = true;
+                                helper.cmd_mark_dirty();
+                            }
                             break;
                         },
                         Err(_) => {
                             let idle_ms = Instant::now().duration_since(last_chunk_at).as_millis();
                             helper.log_warn(&format!("Input timeout: no data for {} ms, reconnecting", idle_ms));
+                            
+                            if !dirty {
+                                dirty = true;
+                                helper.cmd_mark_dirty();
+                            }
                             break;
                         }
                     };

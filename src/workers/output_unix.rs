@@ -1,19 +1,10 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use bytes::Bytes;
-use futures::Stream;
-use futures::StreamExt;
-use http_body_util::StreamBody;
-use hyper::body::{Frame, Incoming};
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{header, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
-use std::collections::HashSet;
-use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::net::TcpListener;
-use tokio::sync::{RwLock, broadcast};
-use tokio_stream::wrappers::BroadcastStream;
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
+use tokio::net::UnixListener;
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::{config, misc};
@@ -21,7 +12,6 @@ use crate::mux::PacketHandler;
 use crate::workers::{Helper, OutputStats};
 
 const BROADCAST_CAPACITY: usize = 256;
-
 pub async fn output(
     rtx: broadcast::Sender<Bytes>,
     output: config::Output,
@@ -30,8 +20,8 @@ pub async fn output(
     stats: Arc<OutputStats>,
 ) -> Result<()> {
     helper.set_output_id(output.id);
-    helper.set_namespace(&format!("Output http #{}", output.id));
-    helper.log_play(&format!("Output http {} running", output.output_url));
+    helper.set_namespace(&format!("Output unix #{}", output.id));
+    helper.log_play(&format!("Output unix {} running", output.output_url));
 
     let packet_handler_helper = helper.clone();
 
@@ -52,11 +42,13 @@ async fn server(
     mut packet_handler: PacketHandler,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let url = &packet_handler.output.output_url;
-
-    let listener = TcpListener::bind(url).await?;
-
-    let connections: Arc<RwLock<HashSet<SocketAddr>>> = Arc::new(RwLock::new(HashSet::new()));
+    let socket_path = packet_handler.output.output_url.clone();
+    if let Ok(exists) = fs::try_exists(&socket_path).await {
+        if exists && let Err(e) = fs::remove_file(&socket_path).await {
+            return Err(anyhow!("Error removing socket file: {:?}", e));
+        }
+    }
+    let listener = UnixListener::bind(&socket_path)?;
 
     let (tx, _rx) = broadcast::channel::<Bytes>(BROADCAST_CAPACITY);
 
@@ -65,43 +57,50 @@ async fn server(
     let cancel_accept = cancel.clone();
     let tx_accept = tx.clone();
     let mut helper_accept = packet_handler.helper.clone();
-    let connections_accept = Arc::clone(&connections);
     let accept_task = tokio::spawn(async move {
         let mut err_count = 0;
         loop {
             tokio::select! {
                 biased;
                 _ = cancel_accept.cancelled() => {
-                    helper_accept.log_pause("Output http listen stoping");
+                    helper_accept.log_pause("Output unix listen stoping");
                     break;
                 },
                 res = listener.accept() => {
                     match res {
-                        Ok((stream, addr)) => {
+                        Ok((mut stream, _addr)) => {
                             err_count = 0;
-                            helper_accept.log(&format!("New connection from {}", addr));
-                            connections_accept.write().await.insert(addr);
-
                             let cancel_clone = cancel_accept.clone();
                             let tx_clone = tx_accept.clone();
                             let mut helper_clone = helper_accept.clone();
-                            let connections_clone = Arc::clone(&connections_accept);
                             tokio::spawn(async move {
-                                let io = TokioIo::new(stream);
-                                let svc = service_fn(move |req| handler(req, tx_clone.clone()));
-                                let http = http1::Builder::new();
-                                tokio::select! {
-                                    biased;
-                                    _ = cancel_clone.cancelled() => {
-                                        helper_clone.log(&format!("Closing connection {:?}", addr));
-                                    },
-                                    res = http.serve_connection(io, svc) => {
-                                        if let Err(err) = res {
-                                            helper_clone.log(&format!("Connection error {}: {:?}", addr, err));
-                                        }
+                                let mut rx = tx_clone.subscribe();
+                                loop {
+                                    tokio::select! {
+                                        biased;
+                                        _ = cancel_clone.cancelled() => {
+                                            break;
+                                        },
+                                        res = rx.recv() => {
+                                            match res {
+                                                Ok(chunk) => {
+                                                    if let Err(e) = stream.write_all(&chunk).await {
+                                                        helper_clone.log(&format!("Client disconnected: {:?}", e));
+                                                        break;
+                                                    }
+                                                },
+                                                Err(broadcast::error::RecvError::Lagged(n)) => {
+                                                    helper_clone.log(&format!("lagged {}", n));
+                                                    continue;
+                                                },
+                                                Err(e) => {
+                                                    helper_clone.log(&format!("received failed:{:?}", e));
+                                                    continue;
+                                                }
+                                            };
+                                        },
                                     }
                                 }
-                                connections_clone.write().await.remove(&addr);
                             });
                         },
                         Err(e) => {
@@ -129,7 +128,7 @@ async fn server(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                packet_handler.helper.log_pause("Output http stoping");
+                packet_handler.helper.log_pause("Output unix stoping");
                 break;
             },
             res = rrx.recv() => {
@@ -144,7 +143,7 @@ async fn server(
                             }).await;
                         } else {
                             packet_handler.write(chunk);
-                            while let Some(pkt) = packet_handler.flush_frame() {
+                            while let Some(pkt) = packet_handler.flush_packet_for_vbr() {
                                 sent_bytes += &pkt.len();
                                 let _ = tx.send(pkt);
                             }
@@ -170,32 +169,10 @@ async fn server(
     if let Err(e) = misc::wait_and_abort(accept_task).await {
         packet_handler.helper.log(&format!("Force listening shutdown: {:?}", e));
     }
-    
+
+    if let Err(e) = fs::remove_file(&socket_path).await {
+        return Err(anyhow!("Error removing socket file: {:?}", e));
+    }
+
     Ok(())
-}
-
-async fn handler(
-    _req: Request<Incoming>,
-    tx: broadcast::Sender<Bytes>,
-) -> Result<Response<StreamBody<impl Stream<Item = Result<Frame<Bytes>>>>>> {
-
-    let rx = tx.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(move |item| async move {
-        match item {
-            Ok(bytes) => Some(Ok(Frame::data(bytes))),
-            Err(_) => None,
-        }
-    });
-
-    let body = StreamBody::new(stream);
-    let response = Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "video/mp2t")
-        .header(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")
-        .header(header::PRAGMA, "no-cache")
-        .header(header::EXPIRES, "0")
-        .header(header::CONNECTION, "keep-alive")
-        .body(body)
-        .unwrap();
-    Ok(response)
 }

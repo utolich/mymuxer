@@ -7,26 +7,25 @@ use bytes::{Buf, Bytes, BytesMut};
 use chrono::Utc;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::sync::Notify;
 use crate::psi::pat::PatInfo;
 use crate::psi::pmt::PmtInfo;
 
 const IN_BUFFER_SIZE: usize = 64 * 1024;
 const FRAME_BUFFER_SIZE: usize = 8192;
 const MUX_BUFFER_SIZE: usize = 3 * packet::TS_PACKET_SIZE;
-const MAX_BUFFER_SIZE: usize = 50 * 1024 * 1024;
+const MAX_BUFFER_SIZE: usize = 25 * 1024 * 1024;
 const MAX_BUFFER_COUNT_V: usize = 5_000;
 const MAX_BUFFER_COUNT_A: usize = 500;
 
 const BUFFER_DURATION_MS: usize = 5_000;
-const MAX_BUFFER_DURATION_COEF: usize = 2;
+const BUFFER_DURATION_OVERFLOW_MS: usize = 3_000;
 
 const PERIOD_PAT_MS: u64 = 100;
 const PERIOD_PMT_MS: u64 = 100;
 const PERIOD_SDT_MS: u64 = 1_000;
 const DEFAULT_SERVICE_TYPE: u8 = 0x01;
 
-const DISCONTINUITY_THRESHOLD_MS: u64 = 1_000;
+const DISCONTINUITY_THRESHOLD_MS: u64 = 500;
 
 const DTS_PCR_DIFF_MS: u64 = 300;
 
@@ -227,8 +226,8 @@ pub struct PacketHandler {
     pub(crate) helper: Helper,
     is_ready: bool,
     is_sync: bool,
-    is_buffer_process_async: bool,
-    process_notify: Arc<Notify>,
+    // is_buffer_process_async: bool,
+    // process_notify: Arc<Notify>,
 
     in_buff: BytesMut,
     out_buff_v: OutBuffer,
@@ -244,7 +243,6 @@ pub struct PacketHandler {
     cc_errors: HashMap<u16, usize>,
 
     buffer_duration_ms: u64,
-
     jitter_ms: u64,
     adjust_buf: u64,
 
@@ -291,16 +289,20 @@ impl PacketHandler {
             .ok();
 
         let mut cc_errors = HashMap::new();
+        let mut buffer_duration_ms = 0;
         let mut jitter_ms = 0;
         let mut adjust_buf = 0;
         // ToDo
         output.programs.iter().for_each(|program| {
             program.audio_pids.iter().for_each(|pid| {
                 cc_errors.insert(*pid, 0);
+                stats.update_dts_drift(*pid, 0);
             });
             program.video_pids.iter().for_each(|pid| {
                 cc_errors.insert(*pid, 0);
+                stats.update_dts_drift(*pid, 0);
             });
+            buffer_duration_ms = program.buffer_duration as u64;
             jitter_ms = program.jitter as u64;
             adjust_buf = program.adjust_buf as u64;
         });
@@ -313,8 +315,6 @@ impl PacketHandler {
             helper,
             is_ready: false,
             is_sync: false,
-            is_buffer_process_async: false,
-            process_notify: Arc::new(Notify::new()),
 
             in_buff: BytesMut::with_capacity(IN_BUFFER_SIZE),
             out_buff_v: OutBuffer::new(MAX_BUFFER_COUNT_V),
@@ -328,8 +328,6 @@ impl PacketHandler {
             last_pts_dts: HashMap::new(),
             last_cc: HashMap::new(),
             cc_errors,
-
-            buffer_duration_ms: BUFFER_DURATION_MS as u64,
 
             pat_info: Vec::new(),
             pmt_info: None,
@@ -349,6 +347,7 @@ impl PacketHandler {
                 insert_sdt: None,
             },
 
+            buffer_duration_ms,
             jitter_ms,
             adjust_buf,
 
@@ -446,10 +445,6 @@ impl PacketHandler {
         self.check_buffer_size = true;
     }
 
-    pub fn set_buffer_process_async(&mut self) {
-        self.is_buffer_process_async = true;
-    }
-
     fn mark_dirty(&mut self) {
         self.dirty = true;
         self.buffers_clear();
@@ -475,6 +470,14 @@ impl PacketHandler {
         self.max_buff_size = 0;
     }
 
+    fn buffer_adjust(&mut self) {
+        while self.out_buff_v.duration_ms() > self.buffer_duration_ms {
+            self.get_a_or_v();
+        }
+        self.out_buff_a.inner.shrink_to_fit();
+        self.out_buff_v.inner.shrink_to_fit();
+    }
+
     pub fn write(&mut self, chunk: Bytes) {
         if self.in_buff.len() + chunk.len() < MAX_BUFFER_SIZE {
             self.in_buff.extend_from_slice(&chunk);
@@ -487,32 +490,7 @@ impl PacketHandler {
             self.in_buff = BytesMut::with_capacity(IN_BUFFER_SIZE);
             self.is_sync = false;
         }
-        if self.is_buffer_process_async {
-            self.process_notify.notify_one();
-        } else {
-            self.process();
-        }
-    }
-
-    fn has_work(&self) -> bool {
-        if self.is_ready && !self.is_buffer_drain() {
-            return false;
-        }
-        if !self.is_sync {
-            return self.in_buff.len() >= MUX_BUFFER_SIZE;
-        }
-        self.in_buff.len() >= packet::TS_PACKET_SIZE
-    }
-
-    pub async fn buffer_process(&mut self) -> Result<()> {
-        if !self.has_work() {
-            self.process_notify.notified().await;
-            return Ok(());
-        }
-
         self.process();
-        tokio::task::yield_now().await;
-        Ok(())
     }
 
     fn pat_transport_stream_id(&self) -> u16 {
@@ -533,9 +511,6 @@ impl PacketHandler {
             let available_size =
                 (self.in_buff.len() / packet::TS_PACKET_SIZE) * packet::TS_PACKET_SIZE;
             while pointer < available_size {
-                if self.is_buffer_process_async && self.is_ready && !self.is_buffer_drain() {
-                    break;
-                }
                 if self.in_buff[pointer] == packet::TS_SYNC_BYTE {
                     let pkt_range = pointer..pointer + packet::TS_PACKET_SIZE;
                     pointer += packet::TS_PACKET_SIZE;
@@ -717,13 +692,13 @@ impl PacketHandler {
                                     if let Some(delta_ms) = dts_forward_delta_ms(dts, *last_dts) {
                                         if delta_ms > DISCONTINUITY_THRESHOLD_MS {
                                             discontinuity = true;
-                                            self.helper.log_warn(&format!(
+                                            self.helper.log(&format!(
                                                 "Discontinuity pid: {:#x}, dts jump: {} ms, v:{}, a:{}", pid, delta_ms, self.out_buff_v.size(), self.out_buff_a.size()
                                             ));
                                         }
                                     } else {
                                         discontinuity = true;
-                                        self.helper.log_warn(&format!(
+                                        self.helper.log(&format!(
                                             "Discontinuity pid: {:#x}, invalid dts, v:{}, a:{}", pid, self.out_buff_v.size(), self.out_buff_a.size()
                                         ));
                                     }
@@ -800,34 +775,55 @@ impl PacketHandler {
                     ));
                     self.buffers_clear();
                 } else {
-                    let buffer_duration = self.out_buff_v.duration_ms();
+                    let mut bitrate = self.get_bitrate().unwrap_or(0);
 
-                    if buffer_duration >= self.buffer_duration_ms {
-                        let buff_size = self.out_buff_v.size() + self.out_buff_a.size();
+                    if bitrate == 0 {
+                        let probe_buffer_duration = self.out_buff_v.duration_ms();
+                        if probe_buffer_duration >= BUFFER_DURATION_MS as u64 {
+                            let probe_buff_size = self.out_buff_v.size() + self.out_buff_a.size();
+                            bitrate = probe_buff_size as u64 * 8 / probe_buffer_duration;
 
-                        self.min_buff_size = buff_size * 1_000 / buffer_duration as usize / 2;
-                        self.max_buff_size =
-                            buff_size * BUFFER_DURATION_MS * MAX_BUFFER_DURATION_COEF / buffer_duration as usize;
+                            let msg = format!(
+                                "Probe bitrate: duration {} ms, size: {}, bitrate {} kbit/sec",
+                                probe_buffer_duration, probe_buff_size, bitrate
+                            );
+                            self.helper.log_info(&msg);
 
-                        let bitrate = buff_size as u64 * 8 / buffer_duration;
-                        let msg = format!(
-                            "Buffer ready: duration {} ms, bitrate {} kbit/sec, size {} bytes, min {} bytess, max {} bytes",
-                            buffer_duration, bitrate, buff_size, self.min_buff_size, self.max_buff_size
-                        );
+                            bitrate = (bitrate as f64 * 1.2 * 1024.00) as u64;
+                            if let Some(r) = self.pcr_restamper.as_mut() {
+                                if r.target_bitrate_bps == 0 {
+                                    r.target_bitrate_bps = bitrate;
+                                }
+                            }
 
-                        if let Some(r) = self.pcr_restamper.as_mut() {
-                            if r.target_bitrate_bps == 0 {
-                                r.target_bitrate_bps = (bitrate as f64 * 1.2 * 1024.00) as u64;
+                            self.fps = self.calculate_fps().unwrap_or(0.0);
+                        }
+                    }
+
+                    if bitrate != 0 {
+                        let buffer_duration = self.out_buff_v.duration_ms();
+                        if buffer_duration >= self.buffer_duration_ms {
+                            self.buffer_adjust();
+                            let buff_size = self.out_buff_v.size() + self.out_buff_a.size();
+                            self.min_buff_size =
+                                self.get_pkt_size() as usize;
+                            self.max_buff_size =
+                                buff_size + bitrate as usize * BUFFER_DURATION_OVERFLOW_MS / 8 / 1_000;
+
+                            let msg = format!(
+                                "Buffer ready: size: {} bytes, min: {} bytes, max: {} bytes",
+                                buff_size, self.min_buff_size, self.max_buff_size
+                            );
+                            self.helper.log_info(&msg);
+
+                            if let Some(pkt) = self.out_buff_v.front() {
+                                self.resync(pkt.dts);
+                                self.is_ready = true;
+                                self.cc_errors = HashMap::new();
+                                self.stats.update_ready_time(Utc::now());
                             }
                         }
-
-                        self.helper.log_info(&msg);
-                        self.resync(first.dts);
-                        self.fps = self.calculate_fps().unwrap_or(0.0);
-                        self.is_ready = true;
-                        self.cc_errors = HashMap::new();
-                        self.stats.update_ready_time(Utc::now());
-                    };
+                    }
                 }
             }
             _ => {}
@@ -849,6 +845,7 @@ impl PacketHandler {
             .update_bitrate_adjust_null(&mut self.count_adjust_packets_null);
         let fps = self.calculate_fps().unwrap_or(self.fps);
         self.stats.update_fps(&fps);
+        self.stats.update_buffer_duration(self.buffer_duration_ms);
         self.stats.update_jitter(self.jitter_ms);
         self.stats.update_adjust_buf(self.adjust_buf);
         self.stats.update_dirty(self.dirty);
@@ -900,20 +897,7 @@ impl PacketHandler {
             return false;
         };
 
-        if self.out_buff_v.duration_ms() > 2 * BUFFER_DURATION_MS as u64 {
-            self.helper.log(&format!(
-                "Buffer duration exceeded: v:{}, duration:{}",
-                self.out_buff_v.size(),
-                self.out_buff_v.duration_ms()
-            ));
-            return false;
-        };
-
         true
-    }
-
-    fn is_buffer_drain(&self) -> bool {
-        self.out_buff_v.duration_ms() < BUFFER_DURATION_MS as u64
     }
 
     fn is_video_pid(&self, pid: &u16) -> bool {
@@ -1064,8 +1048,7 @@ impl PacketHandler {
         None
     }
 
-
-    fn flush_packet_for_vbr(&mut self) -> Option<Bytes> {
+    pub fn flush_packet_for_vbr(&mut self) -> Option<Bytes> {
         if self.dirty || !self.is_ready {
             return None;
         };
@@ -1104,8 +1087,6 @@ impl PacketHandler {
             }
         }
 
-
-
         if !out.is_empty() {
             Some(out.freeze())
         } else {
@@ -1133,18 +1114,22 @@ impl PacketHandler {
             pkt_count = pkt_count.saturating_sub(flush_count);
         }
 
+        let is_adjust = self.adjust_buf != 0;
+        let min_limit = self.buffer_duration_ms as f64 * (1.00 - self.adjust_buf as f64 / 100.00);
+        let max_limit = self.buffer_duration_ms as f64 * (1.00 + self.adjust_buf as f64 / 100.00);
+
         for _ in 0..pkt_count {
 
             if let Some(r) = self.pcr_restamper.as_mut() {
                 r.total_packets_sent += 1;
             }
 
-            let limit = BUFFER_DURATION_MS as f64 * (1.00 - self.adjust_buf as f64 / 100.00);
-
-            if !self.out_buff_v.is_dirty() && self.out_buff_v.duration_ms() < limit as u64 {
-                out.extend_from_slice(&packet::TS_NULL_PACKET);
-                self.count_adjust_packets_null += 1;
-                continue;
+            if is_adjust {
+                if !self.out_buff_v.is_dirty() && self.out_buff_v.duration_ms() < min_limit as u64 {
+                    out.extend_from_slice(&packet::TS_NULL_PACKET);
+                    self.count_adjust_packets_null += 1;
+                    continue;
+                }
             }
 
             let packet = self.get_a_or_v_ready();
@@ -1155,19 +1140,23 @@ impl PacketHandler {
                     self.process_packet(pkt)
                 }
                 None => {
-                    let pkt =
-                        if self.out_buff_v.duration_ms() > BUFFER_DURATION_MS as u64 - 50 ||
-                            self.out_buff_v.is_dirty()
-                    {
-                        self.get_a_or_v()
-                        // self.get_v()
-                    } else {
-                        None
-                    };
+                    if is_adjust {
+                        let pkt =
+                            if self.out_buff_v.is_dirty() {
+                            self.get_a_or_v()
+                            } else if self.out_buff_v.duration_ms() > max_limit as u64 {
+                            self.get_a_or_v_drain()
+                            } else {
+                                None
+                            };
 
-                    if let Some(pkt) = pkt {
-                        self.count_adjust_packets_payload += 1;
-                        self.process_packet(pkt)
+                        if let Some(pkt) = pkt {
+                            self.count_adjust_packets_payload += 1;
+                            self.process_packet(pkt)
+                        } else {
+                            self.count_null_packets += 1;
+                            packet::TS_NULL_PACKET
+                        }
                     } else {
                         self.count_null_packets += 1;
                         packet::TS_NULL_PACKET
@@ -1185,12 +1174,10 @@ impl PacketHandler {
         let mut data = pkt.data;
         let mut discontinuity = pkt.discontinuity;
 
-        if self.is_video_pid(&pkt.pid) {
-            let dts_drift = self.dts_drift(pkt.dts);
-            if !(MIN_DTS_PCR_DIFF_MS..=MAX_DTS_PCR_DIFF_MS).contains(&dts_drift) {
-                discontinuity = true;
-            }
-        }
+         let dts_drift = self.dts_drift(pkt.pid, pkt.dts);
+         if !(MIN_DTS_PCR_DIFF_MS..=MAX_DTS_PCR_DIFF_MS).contains(&dts_drift) {
+             discontinuity = true;
+         }
 
         if discontinuity {
             packet::pkt_set_discontinuity(&mut data);
@@ -1225,26 +1212,35 @@ impl PacketHandler {
     }
 
     fn get_a_or_v_ready(&mut self) -> Option<TsPacket> {
-        let packet = match (self.out_buff_a.front(), self.out_buff_v.front()) {
+        match (self.out_buff_a.front(), self.out_buff_v.front()) {
             (Some(a), Some(v)) if dts_after(a.dts, v.dts) && self.ready_send(v.dts) => {
                 self.out_buff_v.pop_front()
             }
-            (Some(a), Some(v)) if dts_before_or_equal(a.dts, v.dts) && self.ready_send(a.dts) => {
+            (Some(a), Some(v)) if self.ready_send(a.dts) => {
                 self.out_buff_a.pop_front()
             }
             (Some(a), None) if self.ready_send(a.dts) => self.out_buff_a.pop_front(),
             (None, Some(v)) if self.ready_send(v.dts) => self.out_buff_v.pop_front(),
             _ => None,
-        };
-        if self.is_buffer_process_async && packet.is_some() {
-            self.process_notify.notify_one();
-        };
+        }
+    }
 
-        packet
+    fn get_a_or_v_drain(&mut self) -> Option<TsPacket> {
+        match (self.out_buff_a.front(), self.out_buff_v.front()) {
+            (Some(a), Some(v)) if dts_after(a.dts, v.dts) && self.drain_send(v.dts) => {
+                self.out_buff_v.pop_front()
+            }
+            (Some(a), Some(v)) if self.drain_send(a.dts) => {
+                self.out_buff_a.pop_front()
+            }
+            (Some(a), None) if self.drain_send(a.dts) => self.out_buff_a.pop_front(),
+            (None, Some(v)) if self.drain_send(v.dts) => self.out_buff_v.pop_front(),
+            _ => None,
+        }
     }
 
     fn get_a_or_v(&mut self) -> Option<TsPacket> {
-        let packet = match (self.out_buff_a.front(), self.out_buff_v.front()) {
+        match (self.out_buff_a.front(), self.out_buff_v.front()) {
             (Some(a), Some(v)) => {
                 if dts_after(a.dts, v.dts) {
                     self.out_buff_v.pop_front()
@@ -1255,30 +1251,30 @@ impl PacketHandler {
             (Some(_), None) => self.out_buff_a.pop_front(),
             (None, Some(_)) => self.out_buff_v.pop_front(),
             (None, None) => None,
-        };
-        if self.is_buffer_process_async && packet.is_some() {
-            self.process_notify.notify_one();
-        };
-
-        packet
+        }
     }
 
-    // fn get_v(&mut self) -> Option<TsPacket> {
-    //     let packet = match self.out_buff_v.front() {
-    //         Some(_) => self.out_buff_v.pop_front(),
-    //         None => None,
-    //     };
-    //     if self.is_buffer_process_async && packet.is_some() {
-    //         self.process_notify.notify_one();
-    //     };
-    //
-    //     packet
-    // }
-    //
-    pub fn ready_send(&self, pts_or_dts: u64) -> bool {
+    fn get_v(&mut self) -> Option<TsPacket> {
+        match self.out_buff_v.front() {
+            Some(_) => self.out_buff_v.pop_front(),
+            None => None,
+        }
+    }
+
+    pub fn ready_send(&self, dts: u64) -> bool {
         if let Some(current_pcr) = self.pcr_restamper.as_ref().and_then(|r| r.get_pcr()) {
-            let ticks = pcr_normalize(pts_or_dts * 300);
+            let ticks = pcr_normalize(dts * 300);
             let limit = pcr_add(current_pcr, self.jitter_ms * 27_000);
+            !pcr_after(ticks, limit)
+        } else {
+            false
+        }
+    }
+
+    pub fn drain_send(&self, dts: u64) -> bool {
+        if let Some(current_pcr) = self.pcr_restamper.as_ref().and_then(|r| r.get_pcr()) {
+            let ticks = pcr_normalize(dts * 300);
+            let limit = pcr_add(current_pcr, MAX_DTS_PCR_DIFF_MS as u64 * 27_000);
             !pcr_after(ticks, limit)
         } else {
             false
@@ -1289,7 +1285,7 @@ impl PacketHandler {
         self.output.programs.first().unwrap()
     }
 
-    fn dts_drift(&mut self, dts: u64) -> i64 {
+    fn dts_drift(&mut self, pid: u16, dts: u64) -> i64 {
         let mut lead_time_ms: i64 = 0;
         if let Some(r) = &self.pcr_restamper {
             if let Some(current_pcr) = r.get_pcr() {
@@ -1297,7 +1293,7 @@ impl PacketHandler {
                 lead_time_ms = dts_signed_delta(dts, pcr_90k) / 90;
             }
         }
-        self.stats.update_drift(lead_time_ms);
+        self.stats.update_dts_drift(pid, lead_time_ms);
         lead_time_ms
     }
 

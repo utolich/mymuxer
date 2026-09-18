@@ -981,7 +981,7 @@ dependencies = [
 
 [[package]]
 name = "mymuxer"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -999,6 +999,7 @@ dependencies = [
  "m3u8-rs",
  "pkg-config",
  "rand",
+ "redb",
  "reqwest",
  "scopeguard",
  "serde",
@@ -1289,6 +1290,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "99d9a13982dcf210057a8a78572b2217b667c3beacbf3a0d8b454f6f82837d38"
 dependencies = [
  "getrandom 0.3.4",
+]
+
+[[package]]
+name = "redb"
+version = "4.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de6c3b63e007e90ce536ec2ae4690826136a20ec8dbbbb400daef1bb999d2e36"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

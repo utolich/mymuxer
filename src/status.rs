@@ -77,8 +77,9 @@ pub struct OutputStats {
     pub(crate) v_buffer_stats: BufferStats,
     pub(crate) a_buffer_stats: BufferStats,
 
-    pub(crate) drift: AtomicI64,
+    pub(crate) dts_drift: RwLock<HashMap<u16, i64>>,
     pub(crate) pcr_drift: AtomicI64,
+    pub(crate) buffer_duration_ms: AtomicU64,
     pub(crate) jitter_ms: AtomicU64,
     pub(crate) adjust_buf: AtomicU64,
     pub(crate) cc: RwLock<HashMap<u16, usize>>,
@@ -108,8 +109,9 @@ impl OutputStats {
                 size: AtomicUsize::new(0),
                 duration: AtomicU64::new(0),
             },
-            drift: AtomicI64::new(0),
+            dts_drift: RwLock::new(HashMap::new()),
             pcr_drift: AtomicI64::new(0),
+            buffer_duration_ms: AtomicU64::new(0),
             jitter_ms: AtomicU64::new(0),
             adjust_buf: AtomicU64::new(0),
             cc: RwLock::new(HashMap::new()),
@@ -160,12 +162,17 @@ impl OutputStats {
         self.fps.store((fps * 100.0) as u64, Ordering::Relaxed);
     }
 
-    pub fn update_drift(&self, drift: i64) {
-        self.drift.store(drift, Ordering::Relaxed);
+    pub fn update_dts_drift(&self, pid: u16, dts_drift: i64) {
+        if let Ok(mut guard) = self.dts_drift.write() {
+            guard.insert(pid, dts_drift);
+        }
     }
 
     pub fn update_pcr_drift(&self, pcr_drift: i64) {
         self.pcr_drift.store(pcr_drift, Ordering::Relaxed);
+    }
+    pub fn update_buffer_duration(&self, duration: u64) {
+        self.buffer_duration_ms.store(duration, Ordering::Relaxed);
     }
     pub fn update_jitter(&self, jitter: u64) {
         self.jitter_ms.store(jitter, Ordering::Relaxed);

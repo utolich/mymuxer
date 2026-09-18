@@ -10,10 +10,19 @@ use tracing::info;
 
 const PID_FILE: &str = "pid/mymuxer.pid";
 const CONFIG_FILE: &str = "config/config.json";
+pub(crate) const DATABASE_FILE: &str = "data/mymuxer.redb";
 pub(crate) const LOG_DIR: &str = "logs";
 pub(crate) const STREAMS_LOG_DIR: &str = "logs/streams";
-pub(crate) const ALLOWED_TASK_TYPES: [&str; 5] = ["udp", "rtp", "http", "ffmpeg", "hls"];
+pub(crate) const ALLOWED_TASK_TYPES: [&str; 6] = ["udp", "rtp", "http", "ffmpeg", "hls", "unix"];
 pub(crate) const CA_FLAG_UNSCRAMBLED: usize = 1;
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct HttpRouterConfig {
+    pub id: u32,
+    pub url: String,
+    pub routes: Vec<String>,
+    pub allow: Vec<String>,
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct EpgConfig {
@@ -26,6 +35,7 @@ pub struct Config {
     pub mgnt: Mgnt,
     pub epg_configs: Vec<EpgConfig>,
     pub streams: Vec<Stream>,
+    pub http_routers: Vec<HttpRouterConfig>
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -73,6 +83,7 @@ pub struct Program {
     pub service_name: String,
     pub service_provider_name: String,
     pub service_type: u32,
+    pub buffer_duration: u32,
     pub jitter: u32,
     pub adjust_buf: u32,
 }
@@ -121,6 +132,13 @@ pub fn config_filename() -> PathBuf {
     match project_dir() {
         Some(path) => path.join(CONFIG_FILE),
         None => panic!("Error getting config path"),
+    }
+}
+
+pub(crate) fn database_filename() -> PathBuf {
+    match project_dir() {
+        Some(path) => path.join(DATABASE_FILE),
+        None => panic!("Error getting database path"),
     }
 }
 

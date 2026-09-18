@@ -164,7 +164,6 @@ pub fn pkt_has_payload(packet: &[u8]) -> bool {
     match afc {
         0 => {
             // Reserved/Invalid
-            println!("Bad stream");
             false
         }
         1 | 3 => true, // Payload

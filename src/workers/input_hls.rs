@@ -31,6 +31,8 @@ pub async fn remote(
 
     let client = HlsClient::new()?;
 
+    let mut dirty = false;
+
     'send: loop {
         let response = tokio::select! {
             biased;
@@ -60,6 +62,10 @@ pub async fn remote(
                                 Some(chunk) => {
                                     sent_bytes += chunk.len();
                                     send_broadcast_chunks(&tx, chunk);
+                                    if dirty {
+                                        dirty = false;
+                                        helper.cmd_unmark_dirty();
+                                    }
                                 },
                                 None => {
                                     let msg = "Hls client stopped";
@@ -68,6 +74,10 @@ pub async fn remote(
                                         Ok(true) => helper.log("Input HLS stopped"),
                                         Ok(false) => helper.log("Input HLS did not stop within timeout, aborting"),
                                         Err(e) => helper.log(&format!("Input HLS error: {}", e)),
+                                    }
+                                    if !dirty {
+                                        dirty = true;
+                                        helper.cmd_mark_dirty();
                                     }
                                     break;
                                 }
@@ -89,6 +99,10 @@ pub async fn remote(
                     err_count = 0;
                 }
                 err_count += 1;
+                if !dirty {
+                    dirty = true;
+                    helper.cmd_mark_dirty();
+                }
             }
         }
         tokio::select! {

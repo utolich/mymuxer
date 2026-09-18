@@ -36,6 +36,8 @@ pub async fn remote(
         .user_agent("mymuxer")
         .build()?;
 
+    let mut dirty = false;
+
     'send: loop {
         let response = tokio::select! {
             biased;
@@ -55,6 +57,10 @@ pub async fn remote(
                         err_count = 0;
                     }
                     err_count += 1;
+                    if !dirty {
+                        dirty = true;
+                        helper.cmd_mark_dirty();
+                    }
                     continue;
                 }
                 let mut stream = res.bytes_stream();
@@ -75,10 +81,17 @@ pub async fn remote(
                                     send_broadcast_chunks(&tx, chunk);
                                     last_chunk_at = Instant::now();
                                     err_count = 0;
+                                    if dirty {
+                                        dirty = false;
+                                        helper.cmd_unmark_dirty();
+                                    }
                                 },
                                 Ok(Some(Err(e))) => {
                                     helper.log_warn(&format!("Failed to fetch remote data: {:?}", e));
-                                    break;
+                                    if !dirty {
+                                        dirty = true;
+                                        helper.cmd_mark_dirty();
+                                    }
                                 },
                                 Ok(None) => {
                                     if err_count == 0 {
@@ -88,11 +101,19 @@ pub async fn remote(
                                         err_count = 0;
                                     }
                                     err_count += 1;
+                                    if !dirty {
+                                        dirty = true;
+                                        helper.cmd_mark_dirty();
+                                    }
                                     break;
                                 },
                                 Err(_) => {
                                     let idle_ms = Instant::now().duration_since(last_chunk_at).as_millis();
                                     helper.log_warn(&format!("Input timeout: no data for {} ms, reconnecting", idle_ms));
+                                    if !dirty {
+                                        dirty = true;
+                                        helper.cmd_mark_dirty();
+                                    }
                                     break;
                                 }
                             };
@@ -113,6 +134,10 @@ pub async fn remote(
                     err_count = 0;
                 }
                 err_count += 1;
+                if !dirty {
+                    dirty = true;
+                    helper.cmd_mark_dirty();
+                }
             }
         }
         tokio::select! {

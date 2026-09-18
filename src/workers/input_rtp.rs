@@ -47,6 +47,8 @@ pub async fn remote(
 
     let rtp_state = RtpState::new();
 
+    let mut dirty = false;
+    
     'send: loop {
         let response = tokio::select! {
             biased;
@@ -85,14 +87,28 @@ pub async fn remote(
                                     let _ = tx.send(pkt.freeze());
                                     sent_bytes += n;
                                     last_chunk_at = Instant::now();
+                                    if dirty {
+                                        dirty = false;
+                                        helper.cmd_unmark_dirty();
+                                    }
                                 },
                                 Ok(Err(e)) => {
                                     helper.log_warn(&format!("Failed to fetch remote data {:?}", e));
+                                    
+                                    if !dirty {
+                                        dirty = true;
+                                        helper.cmd_mark_dirty();
+                                    }
                                     break;
                                 },
                                 Err(_) => {
                                     let idle_ms = Instant::now().duration_since(last_chunk_at).as_millis();
                                     helper.log_warn(&format!("Input timeout: no data for {} ms, reconnecting", idle_ms));
+                                    
+                                    if !dirty {
+                                        dirty = true;
+                                        helper.cmd_mark_dirty();
+                                    }
                                     break;
                                 }
                             }
@@ -114,6 +130,10 @@ pub async fn remote(
                     err_count = 0;
                 }
                 err_count += 1;
+                if !dirty {
+                    dirty = true;
+                    helper.cmd_mark_dirty();
+                }
             }
         }
         tokio::select! {
