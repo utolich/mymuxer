@@ -7,18 +7,18 @@ use bytes::{Buf, Bytes, BytesMut};
 use chrono::Utc;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Instant;
+use tracing::error;
 use crate::psi::pat::PatInfo;
 use crate::psi::pmt::PmtInfo;
 
 const IN_BUFFER_SIZE: usize = 64 * 1024;
 const FRAME_BUFFER_SIZE: usize = 8192;
-const MUX_BUFFER_SIZE: usize = 3 * packet::TS_PACKET_SIZE;
-const MAX_BUFFER_SIZE: usize = 25 * 1024 * 1024;
-const MAX_BUFFER_COUNT_V: usize = 5_000;
-const MAX_BUFFER_COUNT_A: usize = 500;
-
-const BUFFER_DURATION_MS: usize = 5_000;
-const BUFFER_DURATION_OVERFLOW_MS: usize = 3_000;
+const MIN_BUFFER_SIZE: usize = 0;
+const MAX_BUFFER_SIZE: usize = 10 * 1024 * 1024;
+const BUFFER_DURATION_PROBE_MS: usize = 5_000;
+const BUFFER_DURATION_OVERFLOW_MS: usize = 500;
 
 const PERIOD_PAT_MS: u64 = 100;
 const PERIOD_PMT_MS: u64 = 100;
@@ -99,6 +99,41 @@ fn pcr_normalize(pcr: u64) -> u64 {
     pcr % PCR_CYCLE
 }
 
+
+pub(crate) fn init_biss(biss_key: &str) -> Result<Biss1Descrambler> {
+    if biss_key.len() > 0 {
+        match Biss1Descrambler::new_from_hex(&biss_key) {
+            Ok(biss) => Ok(biss),
+            Err(e) => Err(e),
+        }
+    } else {
+        Err(anyhow!("BISS key is empty"))
+    }
+}
+
+pub(crate) fn sync_buffer(buff: &mut BytesMut) -> bool {
+    let mut is_sync = false;
+
+    while buff.len() >= packet::TS_PACKET_SIZE * 3 {
+        if buff[0] == packet::TS_SYNC_BYTE
+            && buff[packet::TS_PACKET_SIZE] == packet::TS_SYNC_BYTE
+            && buff[packet::TS_PACKET_SIZE * 2] == packet::TS_SYNC_BYTE
+        {
+            is_sync = true;
+            break;
+        } else {
+            if let Some(pos) = buff[1..].iter().position(|&b| b == packet::TS_SYNC_BYTE) {
+                buff.advance(pos + 1);
+            } else {
+                buff.clear();
+                break;
+            };
+        }
+    }
+
+    is_sync
+}
+
 struct UpdateTimers {
     insert_pat: Option<u64>,
     insert_pmt: Option<u64>,
@@ -146,16 +181,14 @@ impl TsPacket {
 
 pub struct OutBuffer {
     inner: VecDeque<TsPacket>,
-    max_size: usize,
     unique_frames_count: usize,
     pcr_count: usize,
 }
 
 impl OutBuffer {
-    pub fn new(max_size: usize) -> Self {
+    pub fn new() -> Self {
         Self {
             inner: VecDeque::new(),
-            max_size,
             unique_frames_count: 0,
             pcr_count: 0,
         }
@@ -230,9 +263,10 @@ pub struct PacketHandler {
     // process_notify: Arc<Notify>,
 
     in_buff: BytesMut,
+    frame_buff: BytesMut,
+
     out_buff_v: OutBuffer,
     out_buff_a: OutBuffer,
-    frame_buff: BytesMut,
 
     check_buffer_size: bool,
     min_buff_size: usize,
@@ -271,7 +305,10 @@ pub struct PacketHandler {
     biss: Option<Biss1Descrambler>,
 
     pub(crate) stats: Arc<OutputStats>,
-    dirty: bool,
+
+    dirty_pat: bool,
+    dirty_pmt: bool,
+    dirty_ca: bool,
 }
 
 impl PacketHandler {
@@ -282,17 +319,23 @@ impl PacketHandler {
             None
         };
 
-        let biss = Self::init_biss(&output.biss_key)
+        let biss = init_biss(&output.biss_key)
             .inspect_err(|e| {
                 helper.clone().log(&format!("BISS init failed: {}", e));
             })
             .ok();
 
+        // ToDo
+        if output.programs.len() > 1 {
+            error!("No support multiple programs");
+            return None;
+        }
+
         let mut cc_errors = HashMap::new();
         let mut buffer_duration_ms = 0;
         let mut jitter_ms = 0;
         let mut adjust_buf = 0;
-        // ToDo
+
         output.programs.iter().for_each(|program| {
             program.audio_pids.iter().for_each(|pid| {
                 cc_errors.insert(*pid, 0);
@@ -302,13 +345,11 @@ impl PacketHandler {
                 cc_errors.insert(*pid, 0);
                 stats.update_dts_drift(*pid, 0);
             });
-            buffer_duration_ms = program.buffer_duration as u64;
-            jitter_ms = program.jitter as u64;
-            adjust_buf = program.adjust_buf as u64;
+            buffer_duration_ms = program.buffer_duration;
+            jitter_ms = program.jitter.clamp(MIN_JITTER_MS, MAX_JITTER_MS);
+            adjust_buf = program.adjust_buf;
         });
         stats.update_cc(&cc_errors);
-
-        jitter_ms = jitter_ms.clamp(MIN_JITTER_MS, MAX_JITTER_MS);
 
         Some(Self {
             output,
@@ -317,13 +358,14 @@ impl PacketHandler {
             is_sync: false,
 
             in_buff: BytesMut::with_capacity(IN_BUFFER_SIZE),
-            out_buff_v: OutBuffer::new(MAX_BUFFER_COUNT_V),
-            out_buff_a: OutBuffer::new(MAX_BUFFER_COUNT_A),
             frame_buff: BytesMut::with_capacity(FRAME_BUFFER_SIZE),
 
+            out_buff_v: OutBuffer::new(),
+            out_buff_a: OutBuffer::new(),
+
             check_buffer_size: false,
-            min_buff_size: 0,
-            max_buff_size: 0,
+            min_buff_size: MIN_BUFFER_SIZE,
+            max_buff_size: MAX_BUFFER_SIZE,
 
             last_pts_dts: HashMap::new(),
             last_cc: HashMap::new(),
@@ -362,46 +404,11 @@ impl PacketHandler {
             biss,
 
             stats,
-            dirty: false,
+
+            dirty_pat: false,
+            dirty_pmt: false,
+            dirty_ca: false,
         })
-    }
-
-    pub fn init_biss(biss_key: &str) -> Result<Biss1Descrambler> {
-        if biss_key.len() > 0 {
-            match Biss1Descrambler::new_from_hex(&biss_key) {
-                Ok(biss) => Ok(biss),
-                Err(e) => Err(e),
-            }
-        } else {
-            Err(anyhow!("BISS key is empty"))
-        }
-    }
-
-    pub fn sync_buffer(buff: &mut BytesMut) -> bool {
-        if buff.len() < MUX_BUFFER_SIZE {
-            return false;
-        }
-
-        let mut is_sync = false;
-
-        while buff.len() >= packet::TS_PACKET_SIZE * 3 {
-            if buff[0] == packet::TS_SYNC_BYTE
-                && buff[packet::TS_PACKET_SIZE] == packet::TS_SYNC_BYTE
-                && buff[packet::TS_PACKET_SIZE * 2] == packet::TS_SYNC_BYTE
-            {
-                is_sync = true;
-                break;
-            } else {
-                if let Some(pos) = buff[1..].iter().position(|&b| b == packet::TS_SYNC_BYTE) {
-                    buff.advance(pos + 1);
-                } else {
-                    buff.clear();
-                    break;
-                };
-            }
-        }
-
-        is_sync
     }
 
     pub fn get_pkt_size(&self) -> u16 {
@@ -410,6 +417,14 @@ impl PacketHandler {
         } else {
             self.output.pkt_size
         }
+    }
+
+    fn is_some_program(&self) -> bool {
+        self.output.programs.first().is_some()
+    }
+
+    pub fn get_program(&self) -> &Program {
+        self.output.programs.first().unwrap()
     }
 
     pub fn get_bitrate(&self) -> Option<u64> {
@@ -445,17 +460,6 @@ impl PacketHandler {
         self.check_buffer_size = true;
     }
 
-    fn mark_dirty(&mut self) {
-        self.dirty = true;
-        self.buffers_clear();
-        self.helper.cmd_mark_dirty();
-    }
-
-    fn unmark_dirty(&mut self) {
-        self.dirty = false;
-        self.helper.cmd_unmark_dirty();
-    }
-
     fn buffers_clear(&mut self) {
         let msg = format!(
             "Buffers clear: v:{},  a:{}",
@@ -463,11 +467,14 @@ impl PacketHandler {
             self.out_buff_a.size()
         );
         self.is_ready = false;
-        self.helper.log_warn(&msg);
+        self.helper.mark_dirty(&msg);
         self.out_buff_v.clear();
         self.out_buff_a.clear();
-        self.min_buff_size = 0;
-        self.max_buff_size = 0;
+        self.min_buff_size = MIN_BUFFER_SIZE;
+        self.max_buff_size = MAX_BUFFER_SIZE;
+        self.last_pts_dts = HashMap::new();
+        self.stats.update_max_in_buffer_size(0);
+        self.stats.update_max_out_buffer_size(0, 0);
     }
 
     fn buffer_adjust(&mut self) {
@@ -476,12 +483,11 @@ impl PacketHandler {
         }
         self.out_buff_a.inner.shrink_to_fit();
         self.out_buff_v.inner.shrink_to_fit();
+        self.in_buff = BytesMut::from(&self.in_buff[..]);
     }
 
     pub fn write(&mut self, chunk: Bytes) {
-        if self.in_buff.len() + chunk.len() < MAX_BUFFER_SIZE {
-            self.in_buff.extend_from_slice(&chunk);
-        } else {
+        if self.in_buff.len() + chunk.len() >= MAX_BUFFER_SIZE {
             self.helper.log_warn(&format!(
                 "Input buffer overflow: {}/{}",
                 self.in_buff.len(),
@@ -490,16 +496,174 @@ impl PacketHandler {
             self.in_buff = BytesMut::with_capacity(IN_BUFFER_SIZE);
             self.is_sync = false;
         }
+        self.in_buff.extend_from_slice(&chunk);
+        self.stats.update_max_in_buffer_size(self.in_buff.len());
         self.process();
+        self.stats.update_max_out_buffer_size(self.out_buff_a.size(), self.out_buff_v.size());
     }
 
     fn pat_transport_stream_id(&self) -> u16 {
         u16::from_be_bytes([self.pat[8], self.pat[9]])
     }
 
+    fn is_dirty(&self) -> bool {
+        self.dirty_pat || self.dirty_pmt || self.dirty_ca
+    }
+
+    fn process_pat(&mut self, pkt_data: &mut [u8;188]) {
+        let pid = packet::pkt_pid(pkt_data);
+        if let Some(mut section) = self.psi_reasm.push(pkt_data) {
+            let pat_info = psi::pat::analyze_pat(&section);
+            if !self.pat_ready {
+                let program = self.get_program();
+                // ToDo
+                // Check pat.program_number == program.program_id, pat.pmt_pid == program.pmt_pid
+
+                // keep program_id and pmt_pid
+                section = psi::pat::patch_pat_section(
+                    &section,
+                    &[(program.program_id, program.pmt_pid)],
+                );
+
+                self.helper.log(&format!("PAT found: {:?}", pat_info));
+                self.helper.log(&format!(
+                    "Patched PAT: {:?}",
+                    psi::pat::analyze_pat(&section)
+                ));
+
+                self.pat_info = pat_info;
+
+                let cc = psi::cached_cc(&self.pat);
+                self.pat = psi::pack(&section, pid, cc);
+                self.pat_ready = true;
+            } else {
+                if psi::pat::is_pat_changed(&self.pat_info, &pat_info) {
+                    self.helper.mark_dirty("PAT changed");
+                    if !self.dirty_pat {
+                        self.dirty_pat = true;
+                        self.helper
+                            .log(&format!("PAT changed: {:?}", pat_info));
+                    }
+                } else {
+                    if self.dirty_pat {
+                        self.dirty_pat = false;
+                        self.helper
+                            .unmark_dirty(&format!("PAT restored: {:?}", pat_info));
+                    }
+                }
+            }
+        }
+    }
+
+    fn process_pmt(&mut self, pkt_data: &mut [u8;188]) {
+        let pid = packet::pkt_pid(pkt_data);
+        if let Some(mut section) = self.psi_reasm.push(pkt_data) {
+            let pmt_info = psi::pmt::analyze_pmt(&section);
+            if !self.pmt_ready {
+                let mut es_mapping = Vec::new();
+                let video_pids = self.get_program().video_pids.clone();
+                for old_pid in video_pids {
+                    es_mapping.push((old_pid, old_pid));
+                }
+                let audio_pids = self.get_program().audio_pids.clone();
+                for old_pid in audio_pids {
+                    es_mapping.push((old_pid, old_pid));
+                }
+                let ca_flag = self.output.ca_flag == config::CA_FLAG_UNSCRAMBLED;
+
+                section = psi::pmt::patch_pmt_section(
+                    &section,
+                    pmt_info.pcr_pid,
+                    &es_mapping,
+                    ca_flag,
+                );
+
+                self.helper.log(&format!("PMT found: {:?}", pmt_info));
+                self.helper.log(&format!(
+                    "Patched PMT: {:?}",
+                    psi::pmt::analyze_pmt(&section)
+                ));
+
+                self.pmt_info = Some(pmt_info);
+
+                let cc = psi::cached_cc(&self.pmt);
+                self.pmt = psi::pack(&section, pid, cc);
+                self.pmt_ready = true;
+            } else if let Some(cur_pmt_info) = &self.pmt_info {
+                if psi::pmt::is_pmt_changed(&cur_pmt_info, &pmt_info) {
+                    self.helper.mark_dirty("PMT changed");
+                    if !self.dirty_pmt {
+                        self.dirty_pmt = true;
+                        self.helper
+                            .log(&format!("PMT changed: {:?}", pmt_info));
+                    }
+                } else {
+                    if self.dirty_pmt {
+                        self.dirty_pmt = false;
+                        self.helper
+                            .unmark_dirty(&format!("PMT restored: {:?}", pmt_info));
+                    }
+                }
+            }
+        }
+    }
+
+    fn process_sdt(&mut self, pkt_data: &mut [u8;188]) {
+        if let Some(section) = self.psi_reasm.push(pkt_data) {
+            let sdts = psi::sdt::analyze_sdt(&section);
+            if !sdts.is_empty() {
+                self.helper.log(&format!("SDT found: {:?}", sdts));
+                let program = self.get_program();
+                if let Some(sdt) = sdts
+                    .iter()
+                    .find(|sdt| sdt.service_id == program.program_id)
+                {
+                    let service_type = if program.service_type == 0 {
+                        match sdt.service_type {
+                            0 => DEFAULT_SERVICE_TYPE,
+                            s => s as u8,
+                        }
+                    } else {
+                        program.service_type as u8
+                    };
+
+                    let provider_name =
+                        match program.service_provider_name.trim() {
+                            "" => sdt.provider_name.trim(),
+                            _ => program.service_provider_name.trim(),
+                        };
+
+                    let service_name = match program.service_name.trim() {
+                        "" => sdt.service_name.trim(),
+                        _ => program.service_name.trim(),
+                    };
+
+                    self.sdt = psi::sdt::prepare_sdt(
+                        self.pat_transport_stream_id(),
+                        program.program_id,
+                        service_type,
+                        provider_name,
+                        service_name,
+                    );
+                    self.sdt_ready = true;
+
+                    self.helper.log(&format!(
+                        "SDT patched: {:?}",
+                        psi::sdt::analyze_sdt(&section)
+                    ));
+                } else {
+                    self.helper.log(&format!(
+                        "SDT found, but service_id {} is not present",
+                        program.program_id
+                    ));
+                }
+            }
+        }
+    }
+
     fn process(&mut self) {
         if !self.is_sync {
-            if Self::sync_buffer(&mut self.in_buff) {
+            if sync_buffer(&mut self.in_buff) {
                 self.is_sync = true;
             } else {
                 return;
@@ -507,9 +671,18 @@ impl PacketHandler {
         }
 
         if self.is_sync {
+            if self.is_buffer_overflow(2) {
+                self.buffers_clear();
+            }
+
             let mut pointer = 0;
             let available_size =
                 (self.in_buff.len() / packet::TS_PACKET_SIZE) * packet::TS_PACKET_SIZE;
+
+            if available_size < packet::TS_PACKET_SIZE {
+                return;
+            }
+
             while pointer < available_size {
                 if self.in_buff[pointer] == packet::TS_SYNC_BYTE {
                     let pkt_range = pointer..pointer + packet::TS_PACKET_SIZE;
@@ -534,149 +707,44 @@ impl PacketHandler {
                                     .log(&format!("BISS descramble error pid {}: {}", pid, e));
                             }
                         }
+                    } else {
+                        let pkt_data = &mut self.in_buff[pkt_range.clone()];
+                        let ca = packet::pkt_scrambling_control(pkt_data);
+                        if ca != 0 {
+                            self.helper.mark_dirty("Stream scrambled");
+                            if !self.dirty_ca {
+                                self.helper
+                                    .log(&format!("PID {:#x} scrambled: {:b}", pid, ca));
+                                self.dirty_ca = true;
+                            }
+                            continue;
+                        } else {
+                            if self.dirty_ca {
+                                self.helper.unmark_dirty("Stream descrambled");
+                                self.dirty_ca = false
+                            }
+                        }
                     }
+
                     let mut pkt_data = [0u8; packet::TS_PACKET_SIZE];
                     pkt_data.copy_from_slice(&self.in_buff[pkt_range]);
+
 
                     match pid {
                         0x1FFF => continue,
                         0x0000 => {
                             if !self.pat_ready || !self.is_ready {
-                                if let Some(mut section) = self.psi_reasm.push(&pkt_data) {
-                                    let pat_info = psi::pat::analyze_pat(&section);
-                                    if !self.pat_ready {
-                                        let program = self.get_program();
-                                        // ToDo
-                                        // Check pat.program_number == program.program_id, pat.pmt_pid == program.pmt_pid
-
-                                        // keep program_id and pmt_pid
-                                        section = psi::pat::patch_pat_section(
-                                            &section,
-                                            &[(program.program_id, program.pmt_pid)],
-                                        );
-
-                                        self.helper.log(&format!("PAT found: {:?}", pat_info));
-                                        self.helper.log(&format!(
-                                            "Patched PAT: {:?}",
-                                            psi::pat::analyze_pat(&section)
-                                        ));
-
-                                        self.pat_info = pat_info;
-
-                                        let cc = psi::cached_cc(&self.pat);
-                                        self.pat = psi::pack(&section, pid, cc);
-                                        self.pat_ready = true;
-                                    } else {
-                                        if psi::pat::is_pat_changed(&self.pat_info, &pat_info) {
-                                            self.helper.log_warn("PAT changed");
-                                            self.mark_dirty();
-                                        } else if self.dirty {
-                                            self.helper.log_warn("PAT restored");
-                                            self.unmark_dirty();
-                                        }
-                                    }
-                                }
+                                self.process_pat(&mut pkt_data);
                             }
                         },
                         id if id == self.get_program().pmt_pid
                             && (!self.pmt_ready || !self.is_ready) => {
-
-                            if let Some(mut section) = self.psi_reasm.push(&pkt_data) {
-                                let pmt_info = psi::pmt::analyze_pmt(&section);
-                                if !self.pmt_ready {
-                                    let mut es_mapping = Vec::new();
-                                    let video_pids = self.get_program().video_pids.clone();
-                                    for old_pid in video_pids {
-                                        es_mapping.push((old_pid, old_pid));
-                                    }
-                                    let audio_pids = self.get_program().audio_pids.clone();
-                                    for old_pid in audio_pids {
-                                        es_mapping.push((old_pid, old_pid));
-                                    }
-                                    let ca_flag = self.output.ca_flag == config::CA_FLAG_UNSCRAMBLED;
-
-                                    section = psi::pmt::patch_pmt_section(
-                                        &section,
-                                        pmt_info.pcr_pid,
-                                        &es_mapping,
-                                        ca_flag,
-                                    );
-
-                                    self.helper.log(&format!("PMT found: {:?}", pmt_info));
-                                    self.helper.log(&format!(
-                                        "Patched PMT: {:?}",
-                                        psi::pmt::analyze_pmt(&section)
-                                    ));
-
-                                    self.pmt_info = Some(pmt_info);
-
-                                    let cc = psi::cached_cc(&self.pmt);
-                                    self.pmt = psi::pack(&section, pid, cc);
-                                    self.pmt_ready = true;
-                                } else if let Some(cur_pmt_info) = &self.pmt_info {
-                                    if psi::pmt::is_pmt_changed(&cur_pmt_info, &pmt_info) {
-                                        self.helper.log_warn("PMT changed");
-                                        self.mark_dirty();
-                                    } else if self.dirty {
-                                        self.helper.log_warn("PMT restored");
-                                        self.unmark_dirty();
-                                    }
-                                }
-                            }
+                            self.process_pmt(&mut pkt_data);
                         },
-                        _ if self.dirty => continue,
+                        _ if self.is_dirty() => continue,
                         0x0011 => {
                             if self.pat_ready && !self.sdt_ready {
-                                if let Some(section) = self.psi_reasm.push(&pkt_data) {
-                                    let sdts = psi::sdt::analyze_sdt(&section);
-                                    if !sdts.is_empty() {
-                                        self.helper.log(&format!("SDT found: {:?}", sdts));
-                                        let program = self.get_program();
-                                        if let Some(sdt) = sdts
-                                            .iter()
-                                            .find(|sdt| sdt.service_id == program.program_id)
-                                        {
-                                            let service_type = if program.service_type == 0 {
-                                                match sdt.service_type {
-                                                    0 => DEFAULT_SERVICE_TYPE,
-                                                    s => s as u8,
-                                                }
-                                            } else {
-                                                program.service_type as u8
-                                            };
-
-                                            let provider_name =
-                                                match program.service_provider_name.trim() {
-                                                    "" => sdt.provider_name.trim(),
-                                                    _ => program.service_provider_name.trim(),
-                                                };
-
-                                            let service_name = match program.service_name.trim() {
-                                                "" => sdt.service_name.trim(),
-                                                _ => program.service_name.trim(),
-                                            };
-
-                                            self.sdt = psi::sdt::prepare_sdt(
-                                                self.pat_transport_stream_id(),
-                                                program.program_id,
-                                                service_type,
-                                                provider_name,
-                                                service_name,
-                                            );
-                                            self.sdt_ready = true;
-
-                                            self.helper.log(&format!(
-                                                "SDT patched: {:?}",
-                                                psi::sdt::analyze_sdt(&section)
-                                            ));
-                                        } else {
-                                            self.helper.log(&format!(
-                                                "SDT found, but service_id {} is not present",
-                                                program.program_id
-                                            ));
-                                        }
-                                    }
-                                }
+                                self.process_sdt(&mut pkt_data);
                             }
                         },
                         id if self.is_audio_pid(&id) || self.is_video_pid(&id) => {
@@ -720,26 +788,20 @@ impl PacketHandler {
                                     self.out_buff_a.push_back(ts_packet);
                                 }
                             }
-
-                            if self.check_buffer_size {
-                                if self.is_ready && !self.is_buffer_valid() {
-                                    self.buffers_clear();
-                                    self.last_pts_dts = HashMap::new();
-                                }
-                            }
                         },
                         _ => {}
                     }
                 } else {
                     self.is_sync = false;
                     self.in_buff.advance(pointer);
+                    self.buffers_clear();
                     return;
                 }
             }
             self.in_buff.advance(pointer);
         }
 
-        if self.dirty { return };
+        if self.is_dirty() { return };
 
         if self.is_ready { return };
 
@@ -779,7 +841,7 @@ impl PacketHandler {
 
                     if bitrate == 0 {
                         let probe_buffer_duration = self.out_buff_v.duration_ms();
-                        if probe_buffer_duration >= BUFFER_DURATION_MS as u64 {
+                        if probe_buffer_duration >= BUFFER_DURATION_PROBE_MS as u64 {
                             let probe_buff_size = self.out_buff_v.size() + self.out_buff_a.size();
                             bitrate = probe_buff_size as u64 * 8 / probe_buffer_duration;
 
@@ -805,10 +867,15 @@ impl PacketHandler {
                         if buffer_duration >= self.buffer_duration_ms {
                             self.buffer_adjust();
                             let buff_size = self.out_buff_v.size() + self.out_buff_a.size();
-                            self.min_buff_size =
-                                self.get_pkt_size() as usize;
+                            // self.min_buff_size =
+                            //     self.get_pkt_size() as usize;
+
+                            let max_duration_ms =
+                                self.buffer_duration_ms as f64 * (1.00 + self.adjust_buf as f64 / 100.00) +
+                                BUFFER_DURATION_OVERFLOW_MS as f64;
+
                             self.max_buff_size =
-                                buff_size + bitrate as usize * BUFFER_DURATION_OVERFLOW_MS / 8 / 1_000;
+                                (bitrate as f64 * max_duration_ms / 8.00 / 1_000.00) as usize;
 
                             let msg = format!(
                                 "Buffer ready: size: {} bytes, min: {} bytes, max: {} bytes",
@@ -818,15 +885,18 @@ impl PacketHandler {
 
                             if let Some(pkt) = self.out_buff_v.front() {
                                 self.resync(pkt.dts);
-                                self.is_ready = true;
                                 self.cc_errors = HashMap::new();
+                                self.is_ready = true;
                                 self.stats.update_ready_time(Utc::now());
+                                self.helper.cmd_unmark_dirty_now();
                             }
                         }
                     }
                 }
             }
-            _ => {}
+            _ => {
+                self.helper.mark_dirty("Buffer empty");
+            }
         };
     }
 
@@ -848,7 +918,7 @@ impl PacketHandler {
         self.stats.update_buffer_duration(self.buffer_duration_ms);
         self.stats.update_jitter(self.jitter_ms);
         self.stats.update_adjust_buf(self.adjust_buf);
-        self.stats.update_dirty(self.dirty);
+        self.stats.update_dirty(self.is_dirty());
     }
 
     fn check_cc(&mut self, packet: &[u8], pid: u16) {
@@ -875,29 +945,22 @@ impl PacketHandler {
             .or_insert(1);
     }
 
-    fn is_buffer_valid(&mut self) -> bool {
-        if self.out_buff_v.size() + self.out_buff_a.size() < self.min_buff_size {
-            self.helper.log(&format!(
-                "Low buffer size: v:{}, a:{}, max:{}",
-                self.out_buff_v.size(),
-                self.out_buff_a.size(),
-                self.max_buff_size,
-            ));
-            return false;
+    fn is_buffer_overflow(&mut self, rate: usize) -> bool {
+        let max_buff_size = self.max_buff_size * rate;
+        if self.out_buff_v.size() + self.out_buff_a.size() > max_buff_size {
+            if rate > 1 {
+                self.helper.log(&format!(
+                    "Buffer overflow: v:{}, a:{}, max:{}",
+                    self.out_buff_v.size(),
+                    self.out_buff_a.size(),
+                    max_buff_size,
+                ));
+            };
+
+            return true;
         };
 
-
-        if self.out_buff_v.size() + self.out_buff_a.size() > self.max_buff_size {
-            self.helper.log(&format!(
-                "Buffer size exceeded: v:{}, a:{}, max:{}",
-                self.out_buff_v.size(),
-                self.out_buff_a.size(),
-                self.max_buff_size,
-            ));
-            return false;
-        };
-
-        true
+        false
     }
 
     fn is_video_pid(&self, pid: &u16) -> bool {
@@ -908,15 +971,99 @@ impl PacketHandler {
         self.get_program().audio_pids.contains(&pid)
     }
 
+    pub async fn proxy_packet<F, Fut>(&mut self, chunk: Bytes, handler: F) -> usize
+    where
+        F: Fn(Bytes) -> Fut,
+        Fut: Future<Output = Result<usize>>,
+    {
+        let mut send_bytes: usize = 0;
+
+        if !self.is_some_program() {
+            send_bytes = chunk.len();
+            let _ = handler(chunk).await;
+            return send_bytes;
+        }
+
+        self.in_buff.extend_from_slice(&chunk);
+
+        if !self.is_sync {
+            if sync_buffer(&mut self.in_buff) {
+                self.is_sync = true;
+            } else {
+                return send_bytes;
+            }
+        }
+        if self.is_sync {
+            let mut pointer = 0;
+            let available_size =
+                (self.in_buff.len() / packet::TS_PACKET_SIZE) * packet::TS_PACKET_SIZE;
+            let pkt_size = self.get_pkt_size() as usize;
+            while pointer < available_size {
+                if self.in_buff[pointer] == packet::TS_SYNC_BYTE {
+                    let pkt_range = pointer..pointer + packet::TS_PACKET_SIZE;
+                    pointer += packet::TS_PACKET_SIZE;
+
+                    let mut pkt_data = [0u8; packet::TS_PACKET_SIZE];
+                    pkt_data.copy_from_slice(&self.in_buff[pkt_range]);
+                    let pid = packet::pkt_pid(&pkt_data);
+
+                    match pid {
+                        0x0000 => {
+                            self.process_pat(&mut pkt_data);
+                            if !self.dirty_pat {
+                                packet::pkt_next(self.pat.as_mut_slice());
+                                self.frame_buff.extend_from_slice(self.pat.as_slice());
+                            }
+                        },
+                        id if id == self.get_program().pmt_pid => {
+                            self.process_pmt(&mut pkt_data);
+                            if !self.dirty_pmt {
+                                packet::pkt_next(self.pmt.as_mut_slice());
+                                self.frame_buff.extend_from_slice(self.pmt.as_slice());
+                            }
+                        },
+                        _ if self.is_dirty() => continue,
+                        id if id == self.get_program().pcr_pid => {
+                            self.frame_buff.extend_from_slice(&pkt_data);
+                        },
+                        id if self.is_audio_pid(&id) || self.is_video_pid(&id) => {
+                            self.frame_buff.extend_from_slice(&pkt_data);
+                        },
+                        _ => {}
+                    }
+                } else {
+                    self.is_sync = false;
+                    self.in_buff.advance(pointer);
+                    return send_bytes;
+                }
+
+                if self.frame_buff.len() >= pkt_size {
+                    let pkt = self.frame_buff.split_to(pkt_size);
+                    match handler(pkt.freeze()).await {
+                        Ok(i) => {
+                            send_bytes += i;
+                        }
+                        Err(e) => {
+                            self.helper.log(&format!("proxy send error: {:?}", e));
+                        }
+                    }
+                }
+            }
+            self.in_buff.advance(pointer);
+
+        }
+        send_bytes
+    }
+
     fn flush_psi_packets(&mut self, out: &mut BytesMut) -> usize {
         let pkt_count = 1;
 
         let mut flush_count = 0;
         let pcr = self
-                .pcr_restamper
-                .as_ref()
-                .and_then(|r| r.get_pcr()
-        );
+            .pcr_restamper
+            .as_ref()
+            .and_then(|r| r.get_pcr()
+            );
         if self.pat_ready {
             match (pcr, self.timers.insert_pat) {
                 (Some(pcr), Some(ins_pat)) => {
@@ -985,51 +1132,8 @@ impl PacketHandler {
         flush_count
     }
 
-    pub async fn proxy_packet<F, Fut>(&mut self, chunk: Bytes, handler: F) -> usize
-    where
-        F: Fn(Bytes) -> Fut,
-        Fut: Future<Output = Result<usize>>,
-    {
-        let mut send_bytes: usize = 0;
-
-        if self.output.pkt_size == 0 {
-            send_bytes = chunk.len();
-            let _ = handler(chunk).await;
-            return send_bytes;
-        }
-
-        self.in_buff.extend_from_slice(&chunk);
-
-        if !self.is_sync {
-            if Self::sync_buffer(&mut self.in_buff) {
-                self.is_sync = true;
-            } else {
-                return send_bytes;
-            }
-        }
-        if self.is_sync {
-            while self.in_buff.len() >= self.output.pkt_size as usize {
-                let pkt = self
-                    .in_buff
-                    .split_to(self.output.pkt_size as usize)
-                    .freeze();
-
-                match handler(pkt).await {
-                    Ok(i) => {
-                        send_bytes += i;
-                    }
-                    Err(e) => {
-                        self.helper.log(&format!("proxy send error: {:?}", e));
-                    }
-                }
-            }
-        }
-
-        send_bytes
-    }
-
     pub fn flush_frame(&mut self) -> Option<Bytes> {
-        if self.dirty || !self.is_ready {
+        if self.is_dirty() || !self.is_ready {
             return None;
         };
 
@@ -1049,7 +1153,7 @@ impl PacketHandler {
     }
 
     pub fn flush_packet_for_vbr(&mut self) -> Option<Bytes> {
-        if self.dirty || !self.is_ready {
+        if self.is_dirty() || !self.is_ready {
             return None;
         };
 
@@ -1095,7 +1199,7 @@ impl PacketHandler {
     }
 
     pub fn flush_packet_for_cbr(&mut self) -> Option<Bytes> {
-        if self.dirty || !self.is_ready {
+        if self.is_dirty() || !self.is_ready {
             return None;
         };
 
@@ -1142,10 +1246,10 @@ impl PacketHandler {
                 None => {
                     if is_adjust {
                         let pkt =
-                            if self.out_buff_v.is_dirty() {
-                            self.get_a_or_v()
+                            if self.is_dirty() || self.out_buff_v.is_dirty() || self.is_buffer_overflow(1) {
+                                self.get_a_or_v()
                             } else if self.out_buff_v.duration_ms() > max_limit as u64 {
-                            self.get_a_or_v_drain()
+                                self.get_a_or_v_drain()
                             } else {
                                 None
                             };
@@ -1213,14 +1317,14 @@ impl PacketHandler {
 
     fn get_a_or_v_ready(&mut self) -> Option<TsPacket> {
         match (self.out_buff_a.front(), self.out_buff_v.front()) {
-            (Some(a), Some(v)) if dts_after(a.dts, v.dts) && self.ready_send(v.dts) => {
+            (Some(a), Some(v)) if dts_after(a.dts, v.dts) && (self.ready_send(v.dts) || v.discontinuity) => {
                 self.out_buff_v.pop_front()
             }
-            (Some(a), Some(v)) if self.ready_send(a.dts) => {
+            (Some(a), Some(_)) if self.ready_send(a.dts) || a.discontinuity => {
                 self.out_buff_a.pop_front()
             }
-            (Some(a), None) if self.ready_send(a.dts) => self.out_buff_a.pop_front(),
-            (None, Some(v)) if self.ready_send(v.dts) => self.out_buff_v.pop_front(),
+            (Some(a), None) if self.ready_send(a.dts) || a.discontinuity => self.out_buff_a.pop_front(),
+            (None, Some(v)) if self.ready_send(v.dts) || v.discontinuity => self.out_buff_v.pop_front(),
             _ => None,
         }
     }
@@ -1279,10 +1383,6 @@ impl PacketHandler {
         } else {
             false
         }
-    }
-
-    pub fn get_program(&self) -> &Program {
-        self.output.programs.first().unwrap()
     }
 
     fn dts_drift(&mut self, pid: u16, dts: u64) -> i64 {

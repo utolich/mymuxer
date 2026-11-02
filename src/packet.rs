@@ -219,3 +219,7 @@ pub fn pkt_next(packet: &mut [u8]) {
     let next_counter = (current_counter + 1) & 0x0F;
     packet[3] = (current_byte & 0xF0) | next_counter;
 }
+
+pub fn pkt_scrambling_control(packet: &[u8]) -> u8 {
+    (packet[3] >> 6) & 0x03
+}

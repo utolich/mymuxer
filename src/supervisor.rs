@@ -190,6 +190,58 @@ impl Supervisor {
             .map(|worker| Self::worker_stat_value(id, worker))
     }
 
+    fn worker_stats_value(id: &u32, worker: &Worker) -> Value {
+        let mut outputs = HashSet::new();
+        let mut buffers_size = 0;
+        for (p, task) in worker.outputs.iter() {
+            let stats: Arc<OutputStats> = Arc::clone(&task.stats);
+            let output_stats = json!({
+                "output_id": p,
+                "max_in_buffer_size": stats.max_in_buffer_size,
+                "max_out_a_buffer_size": stats.a_buffer_stats.max_buffer_size,
+                "max_out_v_buffer_size": stats.v_buffer_stats.max_buffer_size,
+            });
+            buffers_size += stats.max_in_buffer_size.load(Ordering::Relaxed) +
+                stats.a_buffer_stats.max_buffer_size.load(Ordering::Relaxed) +
+                stats.v_buffer_stats.max_buffer_size.load(Ordering::Relaxed);
+
+            outputs.insert(output_stats);
+        }
+        let status = &worker.helper.worker_status;
+        json!({
+            "stream_id": id,
+            "stream_name": worker.config.name,
+            "outputs": outputs,
+            "buffers_size": buffers_size,
+            "dirty_status": json!({
+                "dirty": status.is_dirty(),
+                "dirty_duration": if status.get_last_dirty_time().is_some() {
+                    status.get_last_dirty_time().unwrap().elapsed().as_secs()
+                } else {
+                    0
+                },
+                "message": status.get_unmark_message().unwrap_or("".to_string())
+            })
+        })
+    }
+
+    async fn worker_stats(&self) -> Option<Value> {
+        let guard = self.workers.read().await;
+        let st = guard.iter()
+            .map(|(id, worker)| Self::worker_stats_value(id, worker)).collect::<Vec<Value>>();
+
+        let all_buffers_size =
+            st.iter().map(|s|
+                s["buffers_size"].as_u64().unwrap_or(0)
+            ).sum::<u64>();
+
+        Some(json!({
+            "timestamp": Utc::now().timestamp(),
+            "streams": st,
+            "all_buffers_size": all_buffers_size,
+        }))
+    }
+
     async fn load(&self, cfg_json: String) -> Result<()> {
         let parsed_config = match config::parse_config(&cfg_json) {
             Ok(cfg) => {
@@ -470,7 +522,7 @@ impl Supervisor {
         let mut err_count = 0;
         let mut err_count_payload = 0;
         let mut err_count_send = 0;
-        let err_timer_duration: i32 = 5;
+        let err_timer_duration: i32 = 3;
         let err_count_per_min = 60_i32.saturating_div(err_timer_duration);
         let mut timer = tokio::time::interval(Duration::from_secs(err_timer_duration as u64));
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -492,6 +544,10 @@ impl Supervisor {
                         Some(config) => {
                             let worker_ids: Vec<u32> = {
                                 let guard = self.workers.read().await;
+                                guard.iter().for_each(|(_, worker)| {
+                                    let mut helper = worker.helper.clone();
+                                    helper.cmd_unmark_dirty();
+                                });
                                 guard.keys().copied().collect()
                             };
 
@@ -632,15 +688,17 @@ impl Supervisor {
                 helper.set_output_id(*id);
                 match worker.config.outputs.iter().find(|output| output.id == *id) {
                     Some(output) => {
-                        let schema = match output.task_type.as_str() {
-                            "http" => "http",
-                            "udp" => "udp",
-                            "rtp" => "rtp",
+                        let output_url = output.output_url.clone();
+                        let url = match output.task_type.as_str() {
+                            "http" => format!("http://{}", output_url),
+                            "udp" => format!("udp://{}", output_url),
+                            "rtp" => format!("rtp://{}",output_url),
+                            "unix" => output_url,
                             _ => return None,
                         };
                         let config = Stream {
                             id: worker.config.id,
-                            remote_url: format!("{}://{}", schema, output.output_url.clone()),
+                            remote_url: url,
                             biss_key: output.biss_key.clone(),
                             name: format!("{}_dump", output.name.clone()),
                             task_type: output.task_type.clone(),
@@ -1231,6 +1289,21 @@ async fn server(supervisor: Arc<Supervisor>) -> Result<()> {
                 let supervisor = Arc::clone(&supervisor);
                 move || async move {
                     let body = supervisor.list().await.unwrap();
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(body)
+                        .unwrap()
+                }
+            }),
+        )
+        .route(
+            "/stats",
+            get({
+                let supervisor = Arc::clone(&supervisor);
+                move || async move {
+                    let data = supervisor.worker_stats().await;
+                    let body = serde_json::to_string(&data)
+                        .unwrap_or_else(|e| format!("Error retrieving statistics: {:?}", e));
                     Response::builder()
                         .header(header::CONTENT_TYPE, "application/json")
                         .body(body)

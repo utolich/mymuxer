@@ -11,8 +11,6 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 
 const MAX_BUFFER_SIZE: usize = 1024 * 1024;
-const MUX_BUFFER_SIZE: usize = 3 * packet::TS_PACKET_SIZE;
-
 const PROBE_BUFFER_SIZE: usize = 15 * 1024 * 1024;
 
 const TIMEOUT_SEC: u64 = 5;
@@ -89,10 +87,6 @@ impl Probe {
     fn write(&mut self, chunk: Bytes) -> bool {
         self.in_buff.extend_from_slice(&chunk);
         if !self.is_sync {
-            if self.in_buff.len() < MUX_BUFFER_SIZE {
-                return false;
-            }
-
             while self.in_buff.len() >= packet::TS_PACKET_SIZE * 3 {
                 if self.in_buff[0] == packet::TS_SYNC_BYTE
                     && self.in_buff[packet::TS_PACKET_SIZE] == packet::TS_SYNC_BYTE

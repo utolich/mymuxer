@@ -83,9 +83,9 @@ pub struct Program {
     pub service_name: String,
     pub service_provider_name: String,
     pub service_type: u32,
-    pub buffer_duration: u32,
-    pub jitter: u32,
-    pub adjust_buf: u32,
+    pub buffer_duration: u64,
+    pub jitter: u64,
+    pub adjust_buf: u64,
 }
 
 impl Config {

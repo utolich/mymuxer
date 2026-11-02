@@ -59,42 +59,29 @@ pub async fn remote(
                 res = timeout(input_timeout, stdout.read(&mut buffer)) => {
                     match res {
                         Ok(Ok(0)) => {
-                            helper.log_warn("Input ffmpeg stdout closed");
-                            
-                            if !dirty {
-                                dirty = true;
-                                helper.cmd_mark_dirty();
-                            }
+                            dirty = true;
+                            helper.mark_dirty("Input ffmpeg stdout closed");
                             break;
                         },
                         Ok(Ok(n)) => {
                             sent_bytes += n;
                             let _ = tx.send(Bytes::copy_from_slice(&buffer[..n]));
                             last_chunk_at = Instant::now();
-                            
                             if dirty {
                                 dirty = false;
-                                helper.cmd_unmark_dirty();
+                                helper.cmd_unmark_dirty_now()
                             }
                         },
                         Ok(Err(e)) => {
                             let msg = format!("Failed to fetch remote data {:?}", e);
-                            helper.log_warn(&msg);
-                            
-                            if !dirty {
-                                dirty = true;
-                                helper.cmd_mark_dirty();
-                            }
+                            dirty = true;
+                            helper.mark_dirty(&msg);
                             break;
                         },
                         Err(_) => {
+                            dirty = true;
                             let idle_ms = Instant::now().duration_since(last_chunk_at).as_millis();
-                            helper.log_warn(&format!("Input timeout: no data for {} ms, reconnecting", idle_ms));
-                            
-                            if !dirty {
-                                dirty = true;
-                                helper.cmd_mark_dirty();
-                            }
+                            helper.mark_dirty(&format!("Input timeout: no data for {} ms, reconnecting", idle_ms));
                             break;
                         }
                     };

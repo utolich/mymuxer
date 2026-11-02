@@ -105,13 +105,7 @@ async fn server(
                             });
                         },
                         Err(e) => {
-                            if err_count == 0 {
-                                helper_accept.log_warn(&format!("Accept new connection error: {:?}", e));
-                            } else {
-                                helper_accept.cmd_mark_dirty();
-                                break;
-                            }
-                            err_count += 1;
+                            helper_accept.mark_dirty(&format!("Accept new connection error: {:?}", e));
                         }
                     }
                 }

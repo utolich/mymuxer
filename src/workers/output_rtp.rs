@@ -47,8 +47,6 @@ pub async fn output(
                 }
             }
         }
-    } else {
-        error!("No program found");
     }
 
     Ok(())
@@ -171,7 +169,7 @@ async fn cbr(
     let mut sent_bytes: usize = 0;
     let mut _ticks: usize = 0;
 
-    packet_handler.set_check_buffer_size();
+    // packet_handler.set_check_buffer_size();
 
     let rtp_state = RtpState::new();
 

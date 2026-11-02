@@ -1,6 +1,7 @@
 use crate::psi;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::io::Read;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StreamInfo {
@@ -24,7 +25,7 @@ pub fn analyze_pmt(section: &[u8]) -> PmtInfo {
 
     let mut streams = Vec::new();
     let mut pos = 12 + program_info_len;
-    let section_end = section.len().saturating_sub(4); // Залишаємо місце під CRC
+    let section_end = section.len().saturating_sub(4);
 
     while pos + 5 <= section_end {
         let stype = section[pos];
@@ -62,12 +63,17 @@ fn pasre_descriptors(data: &[u8]) -> HashMap<String, String> {
         if end > data.len() {
             break;
         }
-
         match &tag {
             0x0A if len >= 3 => {
                 descriptors.insert(
                     "lang".to_string(),
                     String::from_utf8_lossy(&data[start..start + 3]).to_string(),
+                );
+            },
+            0x09 => {
+                descriptors.insert(
+                    "ca".to_string(),
+                    "maybe scrambling".to_string(),
                 );
             }
             // 0x6A - на AC-3, 0x59 — subtitles

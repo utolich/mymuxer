@@ -1,9 +1,8 @@
-use crate::config;
-use crate::mux::PacketHandler;
+use crate::{config, mux};
 use crate::proto::rtp::RtpState;
 use crate::workers::{InputStats, Helper};
 use anyhow::Result;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use reqwest::Url;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::UdpSocket as StdUdpSocket;
@@ -18,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 const RTP_RECV_BUFFER_BYTES: usize = 5 * 1024 * 1024;
 const READ_CHUNK_SIZE: usize = 12 + 7 * 188;
+const IN_BUFFER_SIZE: usize = 64 * 1024;
 
 pub async fn remote(
     tx: broadcast::Sender<Bytes>,
@@ -39,7 +39,7 @@ pub async fn remote(
     let err_timer_duration: i32 = 3;
     let err_count_per_min = 60_i32.saturating_div(err_timer_duration);
 
-    let biss = PacketHandler::init_biss(&config.biss_key)
+    let biss = mux::init_biss(&config.biss_key)
         .inspect_err(|e| {
             helper.clone().log(&format!("BISS init failed: {}", e));
         })
@@ -63,6 +63,7 @@ pub async fn remote(
                 let mut last_chunk_at = Instant::now();
                 let input_timeout = Duration::from_secs(5);
                 let mut buffer = [0u8; READ_CHUNK_SIZE];
+                let mut in_buff = BytesMut::with_capacity(IN_BUFFER_SIZE);
                 loop {
                     tokio::select! {
                         biased;
@@ -74,41 +75,36 @@ pub async fn remote(
                         res = timeout(input_timeout, res.recv_from(&mut buffer)) => {
                             match res {
                                 Ok(Ok((n, _address))) => {
-                                    let mut pkt = rtp_state.unpack(&buffer[..n])?;
+                                    let payload = rtp_state.unpack(&buffer[..n])?;
 
-                                    match &biss {
+                                    let pkt = match &biss {
                                         Some(biss) => {
-                                            biss.descramble_ts_packets(&mut pkt)
-                                                .inspect_err(|e| helper.log(&format!("BISS descramble error : {}", e)))?;
+                                            in_buff.extend_from_slice(&payload);
+                                            biss.descramble_ts_stream(&mut in_buff)
+                                                .inspect_err(|e| helper.log(&format!("BISS descramble error : {}", e)))?
                                         },
-                                        None => {}
+                                        None => Some(payload.freeze()),
                                     };
 
-                                    let _ = tx.send(pkt.freeze());
-                                    sent_bytes += n;
-                                    last_chunk_at = Instant::now();
-                                    if dirty {
-                                        dirty = false;
-                                        helper.cmd_unmark_dirty();
+                                    if let Some(pkt) = pkt {
+                                        sent_bytes += pkt.len();
+                                        let _ = tx.send(pkt);
+                                        last_chunk_at = Instant::now();
+                                        if dirty {
+                                            dirty = false;
+                                            helper.cmd_unmark_dirty_now()
+                                        }
                                     }
                                 },
                                 Ok(Err(e)) => {
-                                    helper.log_warn(&format!("Failed to fetch remote data {:?}", e));
-                                    
-                                    if !dirty {
-                                        dirty = true;
-                                        helper.cmd_mark_dirty();
-                                    }
+                                    dirty = true;
+                                    helper.mark_dirty(&format!("Failed to fetch remote data {:?}", e));
                                     break;
                                 },
                                 Err(_) => {
+                                    dirty = true;
                                     let idle_ms = Instant::now().duration_since(last_chunk_at).as_millis();
-                                    helper.log_warn(&format!("Input timeout: no data for {} ms, reconnecting", idle_ms));
-                                    
-                                    if !dirty {
-                                        dirty = true;
-                                        helper.cmd_mark_dirty();
-                                    }
+                                    helper.mark_dirty(&format!("Input timeout: no data for {} ms, reconnecting", idle_ms));
                                     break;
                                 }
                             }
@@ -123,17 +119,13 @@ pub async fn remote(
                 drop(res);
             }
             Err(e) => {
-                if err_count == 0 {
-                    helper.log(&format!("Connect to {} failed: {:?}", url, e));
-                } else if err_count >= err_count_per_min {
+                dirty = true;
+                helper.mark_dirty(&format!("Connect to {} failed: {:?}", url, e));
+                if err_count >= err_count_per_min {
                     helper.log(&format!("Error occurred {} times per 1 min", err_count));
                     err_count = 0;
                 }
                 err_count += 1;
-                if !dirty {
-                    dirty = true;
-                    helper.cmd_mark_dirty();
-                }
             }
         }
         tokio::select! {

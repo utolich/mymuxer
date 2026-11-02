@@ -1,7 +1,7 @@
-use crate::config;
+use crate::{config, mux};
 use crate::workers::{InputStats, Helper, send_broadcast_chunks};
 use anyhow::Result;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use reqwest::Client;
 use std::sync::Arc;
@@ -9,6 +9,8 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::time::{Instant, sleep, timeout};
 use tokio_util::sync::CancellationToken;
+
+const IN_BUFFER_SIZE: usize = 64 * 1024;
 
 pub async fn remote(
     tx: broadcast::Sender<Bytes>,
@@ -36,6 +38,12 @@ pub async fn remote(
         .user_agent("mymuxer")
         .build()?;
 
+    let biss = mux::init_biss(&config.biss_key)
+        .inspect_err(|e| {
+            helper.clone().log(&format!("BISS init failed: {}", e));
+        })
+        .ok();
+
     let mut dirty = false;
 
     'send: loop {
@@ -50,22 +58,19 @@ pub async fn remote(
         match response {
             Ok(res) => {
                 if !res.status().is_success() {
-                    if err_count == 0 {
-                        helper.log_warn(&format!("Status: {}", res.status()));
-                    } else if err_count >= err_count_per_min {
+                    dirty = true;
+                helper.mark_dirty(&format!("Status: {}", res.status()));
+                    if err_count >= err_count_per_min {
                         helper.log(&format!("Error occurred {} times per 1 min", err_count));
                         err_count = 0;
                     }
                     err_count += 1;
-                    if !dirty {
-                        dirty = true;
-                        helper.cmd_mark_dirty();
-                    }
                     continue;
                 }
                 let mut stream = res.bytes_stream();
                 let mut last_chunk_at = Instant::now();
                 let input_timeout = Duration::from_secs(5);
+                let mut in_buff = BytesMut::with_capacity(IN_BUFFER_SIZE);
                 loop {
                     tokio::select! {
                         biased;
@@ -77,43 +82,43 @@ pub async fn remote(
                         res = timeout(input_timeout, stream.next()) => {
                             match res {
                                 Ok(Some(Ok(chunk))) => {
-                                    sent_bytes += chunk.len();
-                                    send_broadcast_chunks(&tx, chunk);
-                                    last_chunk_at = Instant::now();
-                                    err_count = 0;
-                                    if dirty {
-                                        dirty = false;
-                                        helper.cmd_unmark_dirty();
+                                    let pkt = match &biss {
+                                        Some(biss) => {
+                                            in_buff.extend_from_slice(&chunk);
+                                            biss.descramble_ts_stream(&mut in_buff)
+                                                .inspect_err(|e| helper.log(&format!("BISS descramble error : {}", e)))?
+                                        },
+                                        None => Some(chunk),
+                                    };
+
+                                    if let Some(pkt) = pkt {
+                                        sent_bytes += send_broadcast_chunks(&tx, pkt);
+                                        last_chunk_at = Instant::now();
+                                        if dirty {
+                                            dirty = false;
+                                            helper.cmd_unmark_dirty_now()
+                                        }
                                     }
+                                    err_count = 0;
                                 },
                                 Ok(Some(Err(e))) => {
-                                    helper.log_warn(&format!("Failed to fetch remote data: {:?}", e));
-                                    if !dirty {
-                                        dirty = true;
-                                        helper.cmd_mark_dirty();
-                                    }
+                                    dirty = true;
+                                    helper.mark_dirty(&format!("Failed to fetch remote data: {:?}", e));
                                 },
                                 Ok(None) => {
-                                    if err_count == 0 {
-                                        helper.log_warn("Connection closed by remote");
-                                    } else if err_count >= err_count_per_min {
+                                    dirty = true;
+                                    helper.mark_dirty("Connection closed by remote");
+                                    if err_count >= err_count_per_min {
                                         helper.log(&format!("Error occurred {} times per 1 min", err_count));
                                         err_count = 0;
                                     }
                                     err_count += 1;
-                                    if !dirty {
-                                        dirty = true;
-                                        helper.cmd_mark_dirty();
-                                    }
                                     break;
                                 },
                                 Err(_) => {
+                                    dirty = true;
                                     let idle_ms = Instant::now().duration_since(last_chunk_at).as_millis();
-                                    helper.log_warn(&format!("Input timeout: no data for {} ms, reconnecting", idle_ms));
-                                    if !dirty {
-                                        dirty = true;
-                                        helper.cmd_mark_dirty();
-                                    }
+                                    helper.mark_dirty(&format!("Input timeout: no data for {} ms, reconnecting", idle_ms));
                                     break;
                                 }
                             };
@@ -127,17 +132,13 @@ pub async fn remote(
                 }
             }
             Err(e) => {
-                if err_count == 0 {
-                    helper.log(&format!("Failed to send HTTP request: {:?}", e));
-                } else if err_count >= err_count_per_min {
+                dirty = true;
+                helper.mark_dirty(&format!("Failed to send HTTP request: {:?}", e));
+                if err_count >= err_count_per_min {
                     helper.log(&format!("Error occurred {} times per 1 min", err_count));
                     err_count = 0;
                 }
                 err_count += 1;
-                if !dirty {
-                    dirty = true;
-                    helper.cmd_mark_dirty();
-                }
             }
         }
         tokio::select! {

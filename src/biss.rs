@@ -1,5 +1,7 @@
+use crate::mux::sync_buffer;
 use crate::packet::TS_PACKET_SIZE;
 use anyhow::{Result, anyhow, bail};
+use bytes::{Bytes, BytesMut};
 
 #[cfg(feature = "dvbcsa")]
 mod dvbcsa {
@@ -72,38 +74,34 @@ impl Biss1Descrambler {
         }
 
         let scrambling = packet[3] & 0xC0;
-        if scrambling == 0 {
+        // 0x40 is reserved
+        if scrambling == 0 || scrambling == 0x40 {
             return Ok(false);
         }
 
         let af_control = (packet[3] >> 4) & 0x03;
-        if af_control == 0 || af_control == 2 {
-            return Ok(false);
-        }
+        let payload_offset = match af_control {
+            1 => 4usize,
+            3 => 5 + packet[4] as usize,
+            _ => TS_PACKET_SIZE,
+        };
 
-        let mut payload_offset = 4usize;
-        if af_control == 3 {
-            let af_len = packet[4] as usize;
-            payload_offset = payload_offset
-                .checked_add(1 + af_len)
-                .ok_or_else(|| anyhow!("adaptation field length overflow"))?;
-            if payload_offset >= TS_PACKET_SIZE {
-                return Ok(false);
-            }
+        // Payload shorter than one CSA block (8 bytes) is transmitted in clear,
+        // but scrambling bits are still set by the scrambler, so just reset them.
+        if payload_offset + 8 > TS_PACKET_SIZE {
+            packet[3] &= 0x3F;
+            return Ok(false);
         }
 
         let payload_len = TS_PACKET_SIZE - payload_offset;
-        if payload_len <= 7 {
-            return Ok(false);
-        }
 
         #[cfg(feature = "dvbcsa")]
         {
             unsafe {
-                let key = match scrambling {
-                    0x80 => self.key_even,
-                    0xC0 => self.key_odd,
-                    _ => return Ok(false),
+                let key = if scrambling == 0x80 {
+                    self.key_even
+                } else {
+                    self.key_odd
                 };
 
                 dvbcsa::dvbcsa_decrypt(
@@ -134,6 +132,19 @@ impl Biss1Descrambler {
             }
         }
         Ok(processed)
+    }
+
+    /// Descramble whole TS packets from the beginning of `buff` and split them off.
+    /// The incomplete tail stays in `buff` until the next call.
+    pub fn descramble_ts_stream(&self, buff: &mut BytesMut) -> Result<Option<Bytes>> {
+        if !sync_buffer(buff) {
+            return Ok(None);
+        }
+
+        let len = (buff.len() / TS_PACKET_SIZE) * TS_PACKET_SIZE;
+        self.descramble_ts_packets(&mut buff[..len])?;
+
+        Ok(Some(buff.split_to(len).freeze()))
     }
 }
 

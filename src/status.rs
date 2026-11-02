@@ -34,6 +34,7 @@ pub enum ApiActions {
 pub struct BufferStats {
     pub(crate) size: AtomicUsize,
     pub(crate) duration: AtomicU64,
+    pub(crate) max_buffer_size: AtomicU64
 }
 
 #[derive(Serialize)]
@@ -65,6 +66,7 @@ pub struct OutputStats {
     pub(crate) start_timestamp: AtomicI64,
     pub(crate) last_ready_timestamp: AtomicI64,
     pub(crate) in_buffer_len: AtomicU64,
+    pub(crate) max_in_buffer_size: AtomicU64,
 
     pub(crate) bitrate: AtomicU64,
     pub(crate) bitrate_psi: AtomicU64,
@@ -92,6 +94,7 @@ impl OutputStats {
             start_timestamp: AtomicI64::new(Utc::now().timestamp()),
             last_ready_timestamp: AtomicI64::new(Utc::now().timestamp()),
             in_buffer_len: AtomicU64::new(0),
+            max_in_buffer_size: AtomicU64::new(0),
 
             bitrate: AtomicU64::new(0),
             bitrate_psi: AtomicU64::new(0),
@@ -104,10 +107,12 @@ impl OutputStats {
             v_buffer_stats: BufferStats {
                 size: AtomicUsize::new(0),
                 duration: AtomicU64::new(0),
+                max_buffer_size: AtomicU64::new(0),
             },
             a_buffer_stats: BufferStats {
                 size: AtomicUsize::new(0),
                 duration: AtomicU64::new(0),
+                max_buffer_size: AtomicU64::new(0),
             },
             dts_drift: RwLock::new(HashMap::new()),
             pcr_drift: AtomicI64::new(0),
@@ -215,6 +220,16 @@ impl OutputStats {
             .duration
             .store(buffer.duration_ms(), Ordering::Relaxed);
     }
+    
+    pub fn update_max_in_buffer_size(&self, size: usize) {
+        self.max_in_buffer_size.fetch_max(size as u64, Ordering::Relaxed);
+    }
+
+    pub fn update_max_out_buffer_size(&self, a_size: usize, v_size: usize) {
+        self.a_buffer_stats.max_buffer_size.fetch_max(a_size as u64, Ordering::Relaxed);
+        self.v_buffer_stats.max_buffer_size.fetch_max(v_size as u64, Ordering::Relaxed);
+    }
+
 }
 
 #[derive(Clone)]

@@ -8,7 +8,9 @@ use serde::Serialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use strum::Display;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -32,6 +34,8 @@ mod input_unix;
 
 const BROADCAST_CAPACITY: usize = 256;
 const BROADCAST_CHUNK_SIZE: usize = 64 * crate::packet::TS_PACKET_SIZE;
+
+const DIRTY_TIMEOUT_SEC: u64 = 30;
 
 pub fn send_broadcast_chunks(tx: &broadcast::Sender<Bytes>, chunk: Bytes) -> usize {
     let len = chunk.len();
@@ -317,12 +321,54 @@ enum ApiMessage {
     },
 }
 
+pub struct WorkerStatus {
+    dirty: AtomicBool,
+    last_dirty_time: Mutex<Option<Instant>>,
+    unmark_message: Mutex<Option<String>>,
+}
+
+impl WorkerStatus {
+    fn set_dirty(&self, dirty: bool) {
+        self.dirty.store(dirty, Ordering::Relaxed);
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Relaxed)
+    }
+
+    fn set_last_dirty_time(&self, last_dirty_time: Option<Instant>) {
+        *self.last_dirty_time
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = last_dirty_time;
+    }
+
+    pub fn get_last_dirty_time(&self) -> Option<Instant> {
+        *self.last_dirty_time
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set_unmark_message(&self, message: Option<String>) {
+        *self.unmark_message
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = message;
+    }
+
+    pub fn get_unmark_message(&self) -> Option<String> {
+        self.unmark_message
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
 #[derive(Clone)]
 pub struct Helper {
     worker_id: u32,
     output_id: u32,
     namespace: String,
     api_tx: Option<mpsc::UnboundedSender<ApiMessage>>,
+    pub worker_status: Arc<WorkerStatus>,
     log_writer: NonBlocking,
     _log_guard: Arc<WorkerGuard>,
 }
@@ -338,11 +384,18 @@ impl Helper {
             tracing_appender::rolling::daily(log_dir, format!("s{}.log", worker_id));
         let (log_writer, log_guard) = tracing_appender::non_blocking(file_appender);
 
+        let worker_status = Arc::new(WorkerStatus {
+            dirty: AtomicBool::new(false),
+            last_dirty_time: Mutex::new(None),
+            unmark_message: Mutex::new(None),
+        });
+
         Self {
             worker_id,
             output_id: 0,
             namespace: "main".to_string(),
             api_tx: None,
+            worker_status,
             log_writer,
             _log_guard: Arc::from(log_guard),
         }
@@ -403,11 +456,45 @@ impl Helper {
         });
     }
 
+    pub fn mark_dirty (&mut self, message: &str) {
+        self.worker_status.set_last_dirty_time(Some(Instant::now()));
+        if !self.worker_status.is_dirty() {
+            self.cmd_mark_dirty();
+            self.log_warn(message);
+        }
+    }
+
     pub fn cmd_mark_dirty (&self) {
+        self.worker_status.set_dirty(true);
         self.send_cmd(Cmd::MarkDirty);
     }
-    pub fn cmd_unmark_dirty (&self) {
+
+    pub fn unmark_dirty (&mut self, message: &str) {
+        self.worker_status.set_unmark_message(Some(message.to_string()));
+    }
+
+    pub fn cmd_unmark_dirty (&mut self) {
+        if self.worker_status.get_last_dirty_time()
+            .is_some_and(| t | t.elapsed() > Duration::from_secs(DIRTY_TIMEOUT_SEC))
+        {
+            self.worker_status.set_dirty(false);
+            self.worker_status.set_last_dirty_time(None);
+            self.send_cmd(Cmd::UnMarkDirty);
+            if let Some(message) = self.worker_status.get_unmark_message() {
+                self.log_info(&message);
+                self.worker_status.set_unmark_message(None);
+            }
+        }
+    }
+
+    pub fn cmd_unmark_dirty_now (&mut self) {
+        self.worker_status.set_dirty(false);
+        self.worker_status.set_last_dirty_time(None);
         self.send_cmd(Cmd::UnMarkDirty);
+        if let Some(message) = self.worker_status.get_unmark_message() {
+            self.log_info(&message);
+            self.worker_status.set_unmark_message(None);
+        }
     }
 
     fn send_cmd(&self, cmd: Cmd) {
@@ -495,7 +582,7 @@ pub async fn start(supervisor: &Supervisor, id: &u32) -> Result<Worker> {
         (stream, api_config)
     };
 
-    let mut helper = Helper::new(stream.id);
+    let mut helper = Helper::new(*id);
     helper.set_api_config(api_config);
 
     let worker = Worker::new(stream, helper);

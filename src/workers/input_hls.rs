@@ -64,20 +64,17 @@ pub async fn remote(
                                     send_broadcast_chunks(&tx, chunk);
                                     if dirty {
                                         dirty = false;
-                                        helper.cmd_unmark_dirty();
+                                        helper.cmd_unmark_dirty_now()
                                     }
                                 },
                                 None => {
                                     let msg = "Hls client stopped";
-                                    helper.log_warn(msg);
+                                    dirty = true;
+                                    helper.mark_dirty(msg);
                                     match misc::wait_and_abort(client_handle).await {
                                         Ok(true) => helper.log("Input HLS stopped"),
                                         Ok(false) => helper.log("Input HLS did not stop within timeout, aborting"),
                                         Err(e) => helper.log(&format!("Input HLS error: {}", e)),
-                                    }
-                                    if !dirty {
-                                        dirty = true;
-                                        helper.cmd_mark_dirty();
                                     }
                                     break;
                                 }
@@ -92,17 +89,13 @@ pub async fn remote(
                 }
             }
             Err(e) => {
-                if err_count == 0 {
-                    helper.log(&format!("Failed to send hls request: {:?}", e));
-                } else if err_count >= err_count_per_min {
+                dirty = true;
+                helper.mark_dirty(&format!("Failed to send hls request: {:?}", e));
+                if err_count >= err_count_per_min {
                     helper.log(&format!("Error occurred {} times per 1 min", err_count));
                     err_count = 0;
                 }
                 err_count += 1;
-                if !dirty {
-                    dirty = true;
-                    helper.cmd_mark_dirty();
-                }
             }
         }
         tokio::select! {
